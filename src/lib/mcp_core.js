@@ -916,6 +916,15 @@ class MCPSseClient extends MCPExternalBaseClient {
         const sid = res.headers && (res.headers.get('Mcp-Session-Id') || res.headers.get('mcp-session-id'));
         if (sid) this.sessionId = sid;
       } catch (_) {}
+      // Reject immediately on HTTP error (e.g. 401) so caller can react
+      if (res && !res.ok) {
+        const body = await res.text();
+        const err = new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ''}`);
+        err.statusCode = res.status;
+        err.responseBody = body;
+        this.pendingRequests.delete(payload.id);
+        return Promise.reject(err);
+      }
       // Some servers may respond immediately with JSON-RPC result
       if (res && res.ok) {
         const contentType = res.headers.get('content-type') || '';

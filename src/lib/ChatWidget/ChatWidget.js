@@ -572,7 +572,9 @@ const ChatWidget = ({
                   persistChatHistory = true,
                   historyDepthHours = 24,
                   // Debug logging
-                  debug = false
+                  debug = false,
+                  // Called when a tool execution fails (e.g. 401); use for redirect/login UI
+                  onToolError = null
                     }) => {
   const [inputValue, setInputValue] = useState('');
   const [isExpanded, setIsExpanded] = useState(false);
@@ -669,7 +671,8 @@ const ChatWidget = ({
     readResource,
     persistChatHistory,
     historyDepthHours,
-    debug
+    debug,
+    { onToolError }
   );
 
 
@@ -1438,7 +1441,7 @@ const ChatWidget = ({
                     color: mergedTheme.errorMessageColor
                   }}
                 >
-                  <strong>{currentLocale.error}:</strong> {error}
+                  <strong>{currentLocale.error}:</strong> {typeof error === 'string' ? error : (error?.message ?? '')}
                 </div>
               )}
               <div ref={messagesEndRef}/>

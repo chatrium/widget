@@ -1,6 +1,6 @@
 {
   "name": "@chatrium/widget",
-  "version": "3.0.3",
+  "version": "3.0.4",
   "type": "module",
   "description": "Chatrium Widget - A modern chat widget with voice input and MCP integration for AI assistants",
   "keywords": [

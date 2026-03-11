@@ -495,7 +495,8 @@ function parseAssistantResponse(assistantMsg, availableTools = new Set()) {
   };
 }
 
-export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale = 'en', mcpResources = [], readResourceFn = null, persistChatHistory = true, historyDepthHours = 24, debug = false) => {
+export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale = 'en', mcpResources = [], readResourceFn = null, persistChatHistory = true, historyDepthHours = 24, debug = false, options = {}) => {
+  const { onToolError } = options;
   const [messages, setMessages] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -997,19 +998,34 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
           tool_call_id: toolCallId,
           content: JSON.stringify(result)
         };
-      } catch (error) {
+      } catch (err) {
         if (debug) {
-          console.error('[Debug] Tool execution error:', error);
+          console.error('[Debug] Tool execution error:', err);
           console.log(`[Debug] Tool Error: ${funcName}`, {
             id: toolCallId,
-            error: error.message
+            error: err.message
           });
         }
-        
+        const statusCode = err.statusCode ?? err.data?.statusCode ?? (() => {
+          const m = err.message && (err.message.match(/HTTP (\d{3})/) || err.message.match(/\[(\d{3})\]/));
+          return m ? parseInt(m[1], 10) : undefined;
+        })();
+        const isAuthError = statusCode === 401 || (err.message && /unauthorized|401/i.test(err.message));
+        const code = isAuthError ? 'TOOL_AUTH_ERROR' : 'TOOL_ERROR';
+        const context = { toolName: funcName, toolCallId, statusCode, code };
+        try {
+          onToolError?.(err, context);
+        } catch (_) {}
+        setError({
+          message: err.message,
+          code,
+          statusCode,
+          toolName: funcName
+        });
         return {
           role: "tool",
           tool_call_id: toolCallId,
-          content: JSON.stringify({ error: currentLocale.toolExecutionError.replace('{errorMessage}', error.message) })
+          content: JSON.stringify({ error: currentLocale.toolExecutionError.replace('{errorMessage}', err.message) })
         };
       }
     });
@@ -1042,7 +1058,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     } finally {
       setIsExecutingTools(false);
     }
-  }, [mcpClient, actualToolsSchema, currentLocale, availableTools, debug]);
+  }, [mcpClient, actualToolsSchema, currentLocale, availableTools, debug, onToolError]);
 
   const callOpenAI = useCallback(async (history, options = {}) => {
     // Use provided parameters or defaults
