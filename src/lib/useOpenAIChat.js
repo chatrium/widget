@@ -629,8 +629,9 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
         if (debug) {
           console.log('[Debug] Resources: Loading static resources...', staticResources.length);
         }
-        
-        const MAX_RESOURCE_SIZE = 5000; // 5KB limit per resource
+        // Static context: up to 20% of model context (tokens); ~3.5 chars per token
+        const MAX_TOTAL_SIZE = Math.floor((maxContextSize || 32000) * 0.2 * 3.5);
+        const MAX_RESOURCE_SIZE = Math.max(5000, Math.floor(MAX_TOTAL_SIZE / 4));
         const resourceDataPromises = staticResources.map(async (resource) => {
           try {
             const result = await readResourceFnRef.current(resource.uri);
@@ -687,10 +688,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
             .map(r => `📦 Resource: ${r.name} (${r.uri})\n${r.data}`)
             .join('\n\n---\n\n');
           
-          // Check total size
           const totalSize = resourceContext.length;
-          const MAX_TOTAL_SIZE = 20000; // 20KB total limit
-          
           if (totalSize > MAX_TOTAL_SIZE) {
             if (debug) {
               console.warn(`[Debug] Resources: Total context too large (${totalSize} chars), limiting...`);
@@ -721,7 +719,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     if (staticResources.length > 0 && readResourceFnRef.current && !resourcesLoadedRef.current) {
       loadStaticResourcesData();
     }
-  }, [staticResources.length]); // Only depend on count to avoid re-triggers
+  }, [staticResources.length, maxContextSize]); // Only depend on count to avoid re-triggers
 
   // Load chat history from IndexedDB on mount
   useEffect(() => {
