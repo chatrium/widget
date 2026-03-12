@@ -630,26 +630,35 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
           console.log('[Debug] Resources: Loading static resources...', staticResources.length);
         }
         
+        const MAX_RESOURCE_SIZE = 5000; // 5KB limit per resource
         const resourceDataPromises = staticResources.map(async (resource) => {
           try {
             const result = await readResourceFnRef.current(resource.uri);
-            
-            // Handle both spec-compliant and legacy response formats
-            let data;
+            const mimeType = (result.contents?.[0]?.mimeType || resource.mimeType || '').toLowerCase();
+
+            let dataStr;
             if (result.contents && Array.isArray(result.contents) && result.contents.length > 0) {
-              // Spec-compliant format: { contents: [{ uri, mimeType, text }] }
               const content = result.contents[0];
-              data = content.text ? JSON.parse(content.text) : content;
+              if (content.text != null && content.text !== '') {
+                try {
+                  const data = JSON.parse(content.text);
+                  dataStr = JSON.stringify(data, null, 2);
+                } catch (_) {
+                  if (mimeType === 'text/markdown' || mimeType === 'text/plain' || !mimeType.includes('application/json')) {
+                    dataStr = String(content.text);
+                  } else {
+                    throw new Error('Invalid JSON and not plain text resource');
+                  }
+                }
+              } else {
+                dataStr = JSON.stringify(content, null, 2);
+              }
             } else if (result.data) {
-              // Legacy format: { success: true, data: {...} }
-              data = result.data;
+              dataStr = JSON.stringify(result.data, null, 2);
             } else {
-              data = result;
+              dataStr = JSON.stringify(result, null, 2);
             }
 
-            // Stringify with size limit to prevent huge prompts
-            let dataStr = JSON.stringify(data, null, 2);
-            const MAX_RESOURCE_SIZE = 5000; // 5KB limit per resource
             if (dataStr.length > MAX_RESOURCE_SIZE) {
               dataStr = dataStr.substring(0, MAX_RESOURCE_SIZE) + '\n... (truncated)';
               if (debug) {
@@ -1318,6 +1327,9 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     let uiMessages; // Declare once for reuse throughout the function
 
     try {
+      if (conversationHistoryRef.current.length > 0 && conversationHistoryRef.current[0]?.role === 'system') {
+        conversationHistoryRef.current[0] = { role: 'system', content: systemPrompt };
+      }
       // Add user message
       const userMsgObj = { role: "user", content: originalUserMessage };
       conversationHistoryRef.current.push(userMsgObj);
@@ -1593,7 +1605,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
         isProcessingRef.current = false;
       }
     }
-  }, [isLoading, callOpenAI, handleToolCalls, actualToolsSchema, currentLocale, maxContextSize, persistChatHistory, currentConfigIndex, normalizedConfigs, error]);
+  }, [isLoading, callOpenAI, handleToolCalls, actualToolsSchema, currentLocale, maxContextSize, persistChatHistory, currentConfigIndex, normalizedConfigs, error, systemPrompt]);
 
   // Streaming version of sendMessage
   const sendMessageStream = useCallback(async (userMessage) => {
@@ -1613,6 +1625,9 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     let uiMessages; // Declare once for reuse throughout the function
 
     try {
+      if (conversationHistoryRef.current.length > 0 && conversationHistoryRef.current[0]?.role === 'system') {
+        conversationHistoryRef.current[0] = { role: 'system', content: systemPrompt };
+      }
       // Add user message
       const userMsgObj = { role: "user", content: originalUserMessage };
       conversationHistoryRef.current.push(userMsgObj);
@@ -1907,7 +1922,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
         isProcessingRef.current = false;
       }
     }
-  }, [isLoading, callOpenAIStream, handleToolCalls, currentLocale, locale, validateAssistantContent, maxContextSize, persistChatHistory, currentConfigIndex, normalizedConfigs, error]);
+  }, [isLoading, callOpenAIStream, handleToolCalls, currentLocale, locale, validateAssistantContent, maxContextSize, persistChatHistory, currentConfigIndex, normalizedConfigs, error, systemPrompt]);
 
   // Store sendMessageStream reference for retry logic
   useEffect(() => {
