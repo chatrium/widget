@@ -1,6 +1,6 @@
 {
   "name": "@chatrium/widget",
-  "version": "3.0.4",
+  "version": "3.0.5",
   "type": "module",
   "description": "Chatrium Widget - A modern chat widget with voice input and MCP integration for AI assistants",
   "keywords": [
@@ -52,8 +52,10 @@
   "files": [
     "dist/",
     "README.md",
+    "logo.svg",
     "LICENSE"
   ],
+  "readme": "README.md",
   "author": "Aleksey Tsepelev",
   "license": "MIT",
   "scripts": {

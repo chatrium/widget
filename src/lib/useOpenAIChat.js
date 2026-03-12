@@ -496,7 +496,7 @@ function parseAssistantResponse(assistantMsg, availableTools = new Set()) {
 }
 
 export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale = 'en', mcpResources = [], readResourceFn = null, persistChatHistory = true, historyDepthHours = 24, debug = false, options = {}) => {
-  const { onToolError } = options;
+  const { onToolError, staticResourcePatterns } = options;
   const [messages, setMessages] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -591,31 +591,25 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
       return { staticResources: [], dynamicResources: [] };
     }
 
-    // NEW: Use annotations.cachePolicy to categorize (if available)
+    const defaultPatterns = ['configuration', 'product-catalog', 'catalog', 'faq', 'config', 'settings'];
+    const patterns = [...defaultPatterns, ...(Array.isArray(staticResourcePatterns) ? staticResourcePatterns : [])];
+
     const staticRes = mcpResources.filter(r => {
-      // Check annotations.cachePolicy first (explicit)
       if (r.annotations && r.annotations.cachePolicy) {
         return r.annotations.cachePolicy === 'static';
       }
-      
-      // Fallback: heuristic based on URI patterns (for resources without annotations)
-      const staticURIs = ['configuration', 'product-catalog', 'catalog', 'faq', 'config', 'settings'];
-      return staticURIs.some(pattern => r.uri.toLowerCase().includes(pattern));
+      return patterns.some(pattern => String(pattern && r.uri).toLowerCase().includes(String(pattern).toLowerCase()));
     });
 
     const dynamicRes = mcpResources.filter(r => {
-      // Check annotations.cachePolicy first (explicit)
       if (r.annotations && r.annotations.cachePolicy) {
         return r.annotations.cachePolicy === 'dynamic';
       }
-      
-      // Fallback: anything not matched as static is dynamic
-      const staticURIs = ['configuration', 'product-catalog', 'catalog', 'faq', 'config', 'settings'];
-      return !staticURIs.some(pattern => r.uri.toLowerCase().includes(pattern));
+      return !patterns.some(pattern => String(pattern && r.uri).toLowerCase().includes(String(pattern).toLowerCase()));
     });
 
     return { staticResources: staticRes, dynamicResources: dynamicRes };
-  }, [mcpResources]);
+  }, [mcpResources, staticResourcePatterns]);
 
   // Load static resources on mount and add to context (ONCE)
   useEffect(() => {

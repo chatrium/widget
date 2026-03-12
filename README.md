@@ -670,6 +670,19 @@ annotations: {
 - Best for state that changes frequently
 - Always returns fresh data
 
+### Static resources by URI pattern (heuristic)
+
+When resources are provided by an external MCP server and do not include `annotations.cachePolicy`, the widget treats as static only those whose URI contains built-in patterns (`configuration`, `catalog`, `faq`, `config`, `settings`, etc.). To mark other resources as static (e.g. a user instruction document), pass the `staticResourcePatterns` prop: an array of URI substrings. Any resource whose URI contains one of these substrings (case-insensitive) will be loaded once into the system prompt when the chat opens.
+
+Example: for resource `mcp://mik-api/instruction`, set `staticResourcePatterns={['instruction']}` so its content is loaded into context on startup:
+
+```javascript
+<ChatWidget
+  llmConfigs={[{ modelName: "gpt-4o-mini", baseUrl: "https://...", apiKey: "..." }]}
+  staticResourcePatterns={['instruction']}
+/>
+```
+
 ### Example: Complete Resource Set
 
 ```javascript
@@ -955,6 +968,9 @@ Tool execution limits are configured per LLM config in the `llmConfigs` array (s
 #### Tools Configuration
 - `toolsSchema`: Custom tools schema array (overrides MCP tools if provided)
 - Tool-related settings (`toolsMode`, `validationOptions`) are configured per LLM in the `llmConfigs` array
+
+#### MCP Resources
+- `staticResourcePatterns` (array of strings, optional): URI substrings for heuristic static resource detection. If a resource's URI (case-insensitive) contains any of these substrings, the resource is treated as static and loaded into the system prompt once when the chat opens. Use when resources come from an external MCP server without `annotations.cachePolicy`. Example: `staticResourcePatterns={['instruction']}` makes `mcp://mik-api/instruction` load into context on startup.
 
 #### Debug Mode
 - `debug` (boolean, default: `false`): Enable detailed console logging

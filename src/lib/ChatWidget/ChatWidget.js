@@ -574,7 +574,9 @@ const ChatWidget = ({
                   // Debug logging
                   debug = false,
                   // Called when a tool execution fails (e.g. 401); use for redirect/login UI
-                  onToolError = null
+                  onToolError = null,
+                  // URI substrings for heuristic static resources (e.g. ['instruction'] for mcp://mik-api/instruction)
+                  staticResourcePatterns = null
                     }) => {
   const [inputValue, setInputValue] = useState('');
   const [isExpanded, setIsExpanded] = useState(false);
@@ -672,7 +674,7 @@ const ChatWidget = ({
     persistChatHistory,
     historyDepthHours,
     debug,
-    { onToolError }
+    { onToolError, staticResourcePatterns }
   );
 
 
