@@ -14,6 +14,7 @@ const SimpleCustomWidget = ({
   isLoading,
   error,
   handleSend,
+  handleCancel,
   handleKeyPress,
   showTooltip,
   tooltipMessage
@@ -227,21 +228,43 @@ const SimpleCustomWidget = ({
                 }}
                 disabled={isLoading || isRecording}
               />
-              <button
-                onClick={handleSend}
-                disabled={isLoading || !inputValue.trim() || isRecording}
-                style={{
-                  padding: '10px 15px',
-                  background: '#007bff',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '20px',
-                  cursor: 'pointer',
-                  fontSize: '16px'
-                }}
-              >
-                {isLoading ? '...' : '➤'}
-              </button>
+              {isLoading ? (
+                <button
+                  type="button"
+                  onClick={handleCancel}
+                  title="Отменить запрос"
+                  style={{
+                    padding: '10px 15px',
+                    background: '#e55555',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '20px',
+                    cursor: 'pointer',
+                    fontSize: '18px',
+                    fontWeight: 600,
+                    lineHeight: 1
+                  }}
+                >
+                  ×
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleSend}
+                  disabled={!inputValue.trim() || isRecording}
+                  style={{
+                    padding: '10px 15px',
+                    background: '#007bff',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '20px',
+                    cursor: 'pointer',
+                    fontSize: '16px'
+                  }}
+                >
+                  ➤
+                </button>
+              )}
             </div>
           </div>
         </div>

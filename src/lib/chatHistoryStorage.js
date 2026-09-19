@@ -107,21 +107,76 @@ export const initDB = () => {
   return dbInitPromise;
 };
 
+const hasToolCalls = (msg) => Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
+
+const messageIdentity = (msg) => JSON.stringify({
+  role: msg?.role,
+  content: msg?.content || '',
+  tool_call_id: msg?.tool_call_id || '',
+  tool_calls: (msg?.tool_calls || []).map(tc => tc?.id || tc?.function?.name || '')
+});
+
+const isPersistableMessage = (msg) => {
+  if (!msg || msg.role === 'system') return false;
+  if (msg.role === 'assistant') return hasToolCalls(msg) || !!msg.content;
+  if (msg.role === 'tool') return !!(msg.content || msg.tool_call_id);
+  if (msg.role === 'user') return !!msg.content;
+  return false;
+};
+
 /**
  * Save messages to IndexedDB with timestamps
- * Only saves user and assistant messages (excludes system messages)
+ * Keeps assistant tool_calls (even with empty content) and matching tool responses.
+ * Preserves original timestamps so historyDepthHours can expire inactive messages.
  */
 export const saveMessages = async (storageKey, messages, maxContextSize) => {
   try {
     const db = await initDB();
-    
-    // Filter out system messages and messages without content
-    const messagesToSave = messages
-      .filter(msg => msg.role !== 'system' && msg.content)
-      .map(msg => ({
-        message: msg,
-        timestamp: Date.now()
-      }));
+
+    let previousItems = [];
+    try {
+      previousItems = await new Promise((resolve, reject) => {
+        const tx = db.transaction([STORE_NAME], 'readonly');
+        const req = tx.objectStore(STORE_NAME).get(storageKey);
+        req.onsuccess = () => resolve(req.result?.messages || []);
+        req.onerror = () => reject(req.error);
+      });
+    } catch (_) {
+      previousItems = [];
+    }
+
+    const previousTimestamps = new Map();
+    for (const item of previousItems) {
+      const key = messageIdentity(item.message);
+      if (!previousTimestamps.has(key)) {
+        previousTimestamps.set(key, item.timestamp);
+      }
+    }
+
+    const persistable = (messages || []).filter(isPersistableMessage);
+    const keptToolCallIds = new Set();
+    for (const msg of persistable) {
+      if (hasToolCalls(msg)) {
+        for (const tc of msg.tool_calls) {
+          if (tc?.id) keptToolCallIds.add(tc.id);
+        }
+      }
+    }
+
+    const paired = persistable.filter(msg => {
+      if (msg.role !== 'tool') return true;
+      return !msg.tool_call_id || keptToolCallIds.has(msg.tool_call_id);
+    });
+
+    const cap = typeof maxContextSize === 'number' && maxContextSize > 0
+      ? Math.min(paired.length, Math.max(50, Math.floor(maxContextSize / 20)))
+      : paired.length;
+    const capped = paired.slice(-cap);
+
+    const messagesToSave = capped.map(msg => ({
+      message: msg,
+      timestamp: previousTimestamps.get(messageIdentity(msg)) || Date.now()
+    }));
 
     if (messagesToSave.length === 0) {
       return;

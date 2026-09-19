@@ -31,8 +31,8 @@ export const createVoiceRecognition = (locale, onTranscript, onError, onRecordin
   // Configure recognition
   recognition.continuous = false;
   recognition.interimResults = true;
-  recognition.lang = locale === 'en' ? 'en-US' :
-                    locale === 'zh' ? 'zh-CN' : 'ru-RU';
+  recognition.lang = locale === 'zh' ? 'zh-CN' :
+                    locale === 'ru' ? 'ru-RU' : 'en-US';
 
   // Internal state
   let buffer = '';
@@ -188,6 +188,13 @@ export const createVoiceRecognition = (locale, onTranscript, onError, onRecordin
      * Cleanup resources
      */
     cleanup: () => {
+      recognition.onstart = null;
+      recognition.onresult = null;
+      recognition.onend = null;
+      recognition.onerror = null;
+      recognition.onnomatch = null;
+      recognition.onspeechend = null;
+      recognition.onaudioend = null;
       try {
         recognition.stop();
       } catch (e) {

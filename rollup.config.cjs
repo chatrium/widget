@@ -6,15 +6,26 @@ const postcss = require('rollup-plugin-postcss');
 const replace = require('@rollup/plugin-replace');
 const pkg = require('./package.json');
 
-// Common plugins for all configurations
-const commonPlugins = [
-  replace({
-    preventAssignment: true,
-    values: {
-      __APP_VERSION__: JSON.stringify(pkg.version),
-      __REPO_URL__: JSON.stringify(pkg.repository.url.replace(/^git\+/, '').replace(/\.git$/, ''))
-    }
-  }),
+const replacePlugin = replace({
+  preventAssignment: true,
+  values: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+    __REPO_URL__: JSON.stringify(pkg.repository.url.replace(/^git\+/, '').replace(/\.git$/, ''))
+  }
+});
+
+const createBabelPlugin = (jsxRuntime) => babel({
+  babelHelpers: 'bundled',
+  exclude: 'node_modules/**',
+  presets: [
+    ['@babel/preset-env', { modules: false }],
+    ['@babel/preset-react', { runtime: jsxRuntime }]
+  ],
+  extensions: ['.js', '.jsx']
+});
+
+const sharedPlugins = [
+  replacePlugin,
   resolve({
     browser: true,
     extensions: ['.js', '.jsx']
@@ -22,50 +33,51 @@ const commonPlugins = [
   commonjs({
     include: 'node_modules/**',
     exclude: ['src/**']
-  }),
-  babel({
-    babelHelpers: 'bundled',
-    exclude: 'node_modules/**',
-    presets: [
-      ['@babel/preset-env', { modules: false }],
-      ['@babel/preset-react', { runtime: 'automatic' }]
-    ],
-    extensions: ['.js', '.jsx']
   })
 ];
 
-// Common external dependencies for all configurations
-const commonExternal = [
-  'react',
-  'react-dom',
-  'react/jsx-runtime',
-  'react/jsx-dev-runtime'
-];
+const postcssPlugin = (extract) => postcss({
+  extract,
+  minimize: true,
+  modules: {
+    generateScopedName: '[hash:base64:8]'
+  }
+});
+
+const isExternal = (id) => (
+  id === 'react' ||
+  id === 'react-dom' ||
+  id === 'react/jsx-runtime' ||
+  id === 'react/jsx-dev-runtime' ||
+  id === 'js-tiktoken' ||
+  id.startsWith('js-tiktoken/')
+);
+
+const isExternalUmd = (id) => (
+  id === 'react' ||
+  id === 'react-dom' ||
+  id === 'js-tiktoken' ||
+  id.startsWith('js-tiktoken/')
+);
 
 module.exports = [
-  // CommonJS build
+  // CommonJS build (.cjs so "type": "module" does not treat it as ESM)
   {
     input: 'src/index.js',
     output: {
-      file: 'dist/index.js',
+      file: 'dist/index.cjs',
       format: 'cjs',
       exports: 'named',
-      sourcemap: true,
-      inlineDynamicImports: true
+      sourcemap: true
     },
     plugins: [
-      postcss({
-        extract: false,
-        minimize: true,
-        modules: {
-          generateScopedName: '[hash:base64:8]'
-        }
-      }),
-      ...commonPlugins
+      postcssPlugin('chat-widget.css'),
+      ...sharedPlugins,
+      createBabelPlugin('automatic')
     ],
-    external: commonExternal
+    external: isExternal
   },
-  // ES module build
+  // ES module build (paths with .js for webpack 5 fullySpecified resolution)
   {
     input: 'src/index.js',
     output: {
@@ -73,22 +85,21 @@ module.exports = [
       format: 'es',
       exports: 'named',
       sourcemap: true,
-      inlineDynamicImports: true
+      paths: (id) => {
+        if (id === 'react/jsx-runtime') return 'react/jsx-runtime.js';
+        if (id === 'react/jsx-dev-runtime') return 'react/jsx-dev-runtime.js';
+        return id;
+      }
     },
     plugins: [
-      postcss({
-        extract: false,
-        minimize: true,
-        modules: {
-          generateScopedName: '[hash:base64:8]'
-        }
-      }),
-      ...commonPlugins,
+      postcssPlugin('chat-widget.css'),
+      ...sharedPlugins,
+      createBabelPlugin('automatic'),
       terser()
     ],
-    external: commonExternal
+    external: isExternal
   },
-  // UMD build (for browsers)
+  // UMD build (classic JSX so it maps to React.createElement, not a missing jsxRuntime global)
   {
     input: 'src/index.js',
     output: {
@@ -97,25 +108,17 @@ module.exports = [
       format: 'umd',
       globals: {
         react: 'React',
-        'react-dom': 'ReactDOM',
-        'react/jsx-runtime': 'jsxRuntime',
-        'react/jsx-dev-runtime': 'jsxRuntime'
+        'react-dom': 'ReactDOM'
       },
       exports: 'named',
-      sourcemap: true,
-      inlineDynamicImports: true
+      sourcemap: true
     },
     plugins: [
-      postcss({
-        extract: 'chat-widget.css',
-        minimize: true,
-        modules: {
-          generateScopedName: '[hash:base64:8]'
-        }
-      }),
-      ...commonPlugins,
+      postcssPlugin('chat-widget.css'),
+      ...sharedPlugins,
+      createBabelPlugin('classic'),
       terser()
     ],
-    external: commonExternal
+    external: isExternalUmd
   }
 ];

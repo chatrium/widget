@@ -1,6 +1,6 @@
 {
   "name": "@chatrium/widget",
-  "version": "3.0.7",
+  "version": "3.0.8",
   "type": "module",
   "description": "Chatrium Widget - A modern chat widget with voice input and MCP integration for AI assistants",
   "keywords": [
@@ -26,7 +26,7 @@
     "resources",
     "context"
   ],
-  "main": "dist/index.js",
+  "main": "dist/index.cjs",
   "module": "dist/index.esm.js",
   "browser": "dist/index.umd.js",
   "sideEffects": [
@@ -35,20 +35,22 @@
   "exports": {
     ".": {
       "import": "./dist/index.esm.js",
-      "require": "./dist/index.js",
-      "browser": "./dist/index.umd.js"
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.esm.js"
     },
     "./styles": {
-      "import": "./dist/chat-widget.css",
-      "require": "./dist/chat-widget.css",
-      "browser": "./dist/chat-widget.css"
+      "default": "./dist/chat-widget.css"
     },
     "./styles-map": {
       "import": "./dist/index.esm.js",
-      "require": "./dist/index.js",
-      "browser": "./dist/index.umd.js"
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.esm.js"
     }
   },
+  "browserslist": [
+    "defaults",
+    "not IE 11"
+  ],
   "files": [
     "dist/",
     "README.md",

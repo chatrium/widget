@@ -3,7 +3,7 @@ import openaiLocales from './locales/openai';
 import { generateStorageKey, loadMessages, saveMessages, clearHistory } from './chatHistoryStorage';
 
 // Generate unique IDs for tool calls
-const generateToolCallId = () => `toolcall_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+const generateToolCallId = () => `toolcall_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 
 // Try to import tiktoken (optional dependency)
 let encodingForModel = null;
@@ -44,28 +44,27 @@ const approximateTokenCount = (text) => {
   return Math.ceil(text.length / 3.5);
 };
 
+const tokenCountCache = new WeakMap();
+
 /**
  * Count tokens in a single message
  * Uses tiktoken if available, otherwise falls back to approximate counting
  */
 const countMessageTokens = (message) => {
+  if (message && typeof message === 'object' && tokenCountCache.has(message)) {
+    return tokenCountCache.get(message);
+  }
+
   const enc = getTokenizer();
-  
+  let tokens = 0;
+
   if (enc) {
-    // Use accurate tiktoken counting
-    let tokens = 0;
-    
-    // Count role tokens
     if (message.role) {
       tokens += enc.encode(message.role).length;
     }
-    
-    // Count content tokens
     if (message.content && typeof message.content === 'string') {
       tokens += enc.encode(message.content).length;
     }
-    
-    // Count tool_calls tokens if present
     if (message.tool_calls && Array.isArray(message.tool_calls)) {
       for (const tc of message.tool_calls) {
         if (tc.function) {
@@ -73,39 +72,25 @@ const countMessageTokens = (message) => {
             tokens += enc.encode(tc.function.name).length;
           }
           if (tc.function.arguments) {
-            const argsStr = typeof tc.function.arguments === 'string' 
-              ? tc.function.arguments 
+            const argsStr = typeof tc.function.arguments === 'string'
+              ? tc.function.arguments
               : JSON.stringify(tc.function.arguments);
             tokens += enc.encode(argsStr).length;
           }
         }
       }
     }
-    
-    // Count tool response tokens
     if (message.tool_call_id) {
       tokens += enc.encode(message.tool_call_id).length;
     }
-    
-    // Add overhead tokens per message (empirically ~4 tokens per message for formatting)
     tokens += 4;
-    
-    return tokens;
   } else {
-    // Use approximate counting (fallback)
-    let tokens = 0;
-    
-    // Count role tokens
     if (message.role) {
       tokens += approximateTokenCount(message.role);
     }
-    
-    // Count content tokens
     if (message.content && typeof message.content === 'string') {
       tokens += approximateTokenCount(message.content);
     }
-    
-    // Count tool_calls tokens if present
     if (message.tool_calls && Array.isArray(message.tool_calls)) {
       for (const tc of message.tool_calls) {
         if (tc.function) {
@@ -113,25 +98,24 @@ const countMessageTokens = (message) => {
             tokens += approximateTokenCount(tc.function.name);
           }
           if (tc.function.arguments) {
-            const argsStr = typeof tc.function.arguments === 'string' 
-              ? tc.function.arguments 
+            const argsStr = typeof tc.function.arguments === 'string'
+              ? tc.function.arguments
               : JSON.stringify(tc.function.arguments);
             tokens += approximateTokenCount(argsStr);
           }
         }
       }
     }
-    
-    // Count tool response tokens
     if (message.tool_call_id) {
       tokens += approximateTokenCount(message.tool_call_id);
     }
-    
-    // Add overhead tokens per message (empirically ~4 tokens per message for formatting)
     tokens += 4;
-    
-    return tokens;
   }
+
+  if (message && typeof message === 'object') {
+    tokenCountCache.set(message, tokens);
+  }
+  return tokens;
 };
 
 /**
@@ -141,72 +125,79 @@ const countTotalTokens = (messages) => {
   return messages.reduce((sum, msg) => sum + countMessageTokens(msg), 0);
 };
 
+const groupMessagesIntoBlocks = (messages) => {
+  const blocks = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      const block = [msg];
+      while (i + 1 < messages.length && messages[i + 1].role === 'tool') {
+        i += 1;
+        block.push(messages[i]);
+      }
+      blocks.push(block);
+    } else {
+      blocks.push([msg]);
+    }
+  }
+  return blocks;
+};
+
+const blockTokenCount = (block) => block.reduce((sum, msg) => sum + countMessageTokens(msg), 0);
+
 /**
  * Filter messages to fit within maxTokens context size
  * Always keeps system message (first message)
- * Removes oldest messages first until within limit
- * Marks excluded messages with excludedFromContext flag
+ * Treats assistant tool_calls + following tool responses as an atomic block
  */
 const filterMessagesByContext = (messages, maxTokens) => {
   if (!messages || messages.length === 0) {
     return { filtered: [], allMessages: [] };
   }
-  
+
   const totalTokens = countTotalTokens(messages);
-  
-  // If within limit, return all messages
+
   if (totalTokens <= maxTokens) {
-    return { 
+    return {
       filtered: messages,
       allMessages: messages
     };
   }
-  
-  // Always keep system message (first message)
+
   const systemMessage = messages[0];
   const otherMessages = messages.slice(1);
-  
-  // Start with system message tokens
+  const blocks = groupMessagesIntoBlocks(otherMessages);
+
   let currentTokens = countMessageTokens(systemMessage);
-  
-  // Collect messages from most recent backwards until we hit the limit
-  const reversedOthers = [...otherMessages].reverse();
-  const keptIndices = new Set();
-  const keptMessages = [];
-  
-  for (let i = 0; i < reversedOthers.length; i++) {
-    const msg = reversedOthers[i];
-    const msgTokens = countMessageTokens(msg);
-    
+  const keptBlocks = [];
+
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = blocks[i];
+    const msgTokens = blockTokenCount(block);
     if (currentTokens + msgTokens <= maxTokens) {
-      keptMessages.unshift(msg); // Add to beginning of kept messages (to maintain chronological order)
+      keptBlocks.unshift(block);
       currentTokens += msgTokens;
-      keptIndices.add(otherMessages.length - 1 - i); // Original index in otherMessages
     } else {
       break;
     }
   }
-  
-  // Build filtered array: system message first, then kept messages in chronological order
+
+  while (keptBlocks.length && keptBlocks[0].every(msg => msg.role === 'tool')) {
+    keptBlocks.shift();
+  }
+
+  const keptMessages = keptBlocks.flat();
+  const keptSet = new Set(keptMessages);
   const filtered = [systemMessage, ...keptMessages];
-  
-  // Mark excluded messages
+
   const allMessages = messages.map((msg, index) => {
-    if (index === 0) {
-      // System message is always included
-      return msg;
-    }
-    
-    const otherIndex = index - 1;
-    if (keptIndices.has(otherIndex)) {
-      // This message is included
+    if (index === 0) return msg;
+    if (keptSet.has(msg)) {
       return { ...msg, excludedFromContext: false };
-    } else {
-      // This message is excluded
-      return { ...msg, excludedFromContext: true };
     }
+    return { ...msg, excludedFromContext: true };
   });
-  
+
   return {
     filtered: filtered.map(msg => {
       const { excludedFromContext, ...rest } = msg;
@@ -214,6 +205,43 @@ const filterMessagesByContext = (messages, maxTokens) => {
     }),
     allMessages
   };
+};
+
+const toApiToolCalls = (toolCallsJson) => toolCallsJson.map(tc => ({
+  id: tc.id,
+  type: 'function',
+  function: {
+    name: tc.name,
+    arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments ?? {})
+  }
+}));
+
+const toHistoryAssistantMessage = (assistantMsg, parsed) => {
+  if (parsed.toolCallsJson?.length) {
+    const native = Array.isArray(assistantMsg.tool_calls) && assistantMsg.tool_calls.length > 0;
+    return {
+      role: 'assistant',
+      content: native ? (assistantMsg.content || '') : (parsed.displayContent || ''),
+      tool_calls: native ? assistantMsg.tool_calls : toApiToolCalls(parsed.toolCallsJson)
+    };
+  }
+  return {
+    role: 'assistant',
+    content: assistantMsg.content || parsed.displayContent || ''
+  };
+};
+
+const isEmptyKeyEmptyObjectContent = (content) => {
+  try {
+    const raw = typeof content === 'string' ? content.trim() : '';
+    if (!(raw.startsWith('{') && raw.endsWith('}'))) return false;
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== 'object') return false;
+    const keys = Object.keys(obj);
+    return keys.length === 1 && keys[0] === '' && obj[''] && typeof obj[''] === 'object' && Object.keys(obj['']).length === 0;
+  } catch (_) {
+    return false;
+  }
 };
 
 /**
@@ -454,24 +482,31 @@ function parseAssistantResponse(assistantMsg, availableTools = new Set()) {
         }
       }
 
-      // Legacy bracketed JSON format fallback
+      // Legacy bracketed JSON format fallback: only if the entire content is the array/object
       if (!toolCallsJson) {
-        const toolCallMatch = displayContent.match(/\[([\s\S]*?)\]/i);
-        if (toolCallMatch) {
+        const trimmedContent = displayContent.trim();
+        if (
+          (trimmedContent.startsWith('[') && trimmedContent.endsWith(']')) ||
+          (trimmedContent.startsWith('{') && trimmedContent.endsWith('}'))
+        ) {
           try {
-            const parsedJson = JSON.parse(toolCallMatch[1]);
+            const parsedJson = JSON.parse(trimmedContent);
+            const candidates = Array.isArray(parsedJson) ? parsedJson : [parsedJson];
+            const isValidToolCalls = candidates.length > 0 && candidates.every(tc =>
+              tc && typeof tc === 'object' &&
+              typeof tc.name === 'string' &&
+              tc.arguments !== undefined &&
+              availableTools.has(tc.name)
+            );
 
-            // Validate format
-            if (typeof parsedJson !== 'object' || parsedJson === null) {
-              throw new Error("Parsed JSON is not an object");
+            if (isValidToolCalls) {
+              toolCallsJson = candidates.map(tc => ({
+                id: generateToolCallId(),
+                name: tc.name,
+                arguments: tc.arguments
+              }));
+              displayContent = '';
             }
-
-            toolCallsJson = (Array.isArray(parsedJson) ? parsedJson : [parsedJson]).map(tc => ({
-              id: generateToolCallId(),
-              name: tc.name,
-              arguments: tc.arguments
-            }));
-            displayContent = displayContent.replace(toolCallMatch[0], '').trim();
           } catch (e) {
             // JSON parse error, continue without tool calls
           }
@@ -512,7 +547,14 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
   const storageKeyRef = useRef(null); // Storage key for IndexedDB
   const retryMessageRef = useRef(null); // Store message for retry on config change
   const isRetryingRef = useRef(false); // Flag to indicate we're in retry mode
-  const sendMessageStreamRef = useRef(null); // Ref to current sendMessageStream function
+  const sendMessageStreamRef = useRef(null);
+  const sendMessageRef = useRef(null);
+  const retryStreamingRef = useRef(true);
+  const abortControllerRef = useRef(null);
+  const userCancelledRef = useRef(false);
+  const turnStartIndexRef = useRef(null);
+  const inFlightUserMessageRef = useRef(null);
+  const requestGenRef = useRef(0);
   
   // Ensure llmConfigs is an array with at least one config
   const normalizedConfigs = useMemo(() => {
@@ -564,26 +606,32 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
   
   // Handle automatic retry when config changes
   useEffect(() => {
-    if (isRetryingRef.current && retryMessageRef.current && !isLoading && sendMessageStreamRef.current) {
+    if (isRetryingRef.current && retryMessageRef.current && !isLoading) {
       const messageToRetry = retryMessageRef.current;
+      const useStream = retryStreamingRef.current;
       retryMessageRef.current = null;
       isRetryingRef.current = false;
-      
+
       if (debug) {
         console.info(`[LLM Fallback] Retrying with config ${currentConfigIndex} (${normalizedConfigs[currentConfigIndex].modelName})`);
       }
-      
-      // Use setTimeout to avoid state updates during render
-      setTimeout(() => {
-        if (sendMessageStreamRef.current) {
-          sendMessageStreamRef.current(messageToRetry);
-        }
+
+      const timer = setTimeout(() => {
+        const fn = useStream ? sendMessageStreamRef.current : sendMessageRef.current;
+        if (fn) fn(messageToRetry);
       }, 50);
+      return () => clearTimeout(timer);
     }
-  }, [currentConfigIndex, isLoading, normalizedConfigs]);
+  }, [currentConfigIndex, isLoading, normalizedConfigs, debug]);
+
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
 
   // Get current localization
-  const currentLocale = openaiLocales[locale] || openaiLocales.ru;
+  const currentLocale = openaiLocales[locale] || openaiLocales.en;
 
   // Categorize resources into static and dynamic
   const { staticResources, dynamicResources } = useMemo(() => {
@@ -610,6 +658,44 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
 
     return { staticResources: staticRes, dynamicResources: dynamicRes };
   }, [mcpResources, staticResourcePatterns]);
+
+  // System prompt with localization (recomputed when tools or locale/mode change)
+  // Must be declared before effects that read it (avoid TDZ / always-undefined deps)
+  const systemPrompt = useMemo(() => {
+    let basePrompt;
+    if (toolsMode === 'prompt') {
+      const toolsList = (actualToolsSchema || [])
+        .map(t => `• ${t.function.name}: ${t.function.description}`)
+        .join('\n');
+      basePrompt = (currentLocale.systemPromptWithTools || currentLocale.systemPrompt)
+        .replace('{toolsList}', toolsList);
+    } else {
+      basePrompt = currentLocale.systemPrompt;
+    }
+
+    if (loadedStaticResources) {
+      basePrompt = `${basePrompt}${loadedStaticResources}`;
+    }
+
+    if (systemPromptAddition && typeof systemPromptAddition === 'string' && systemPromptAddition.trim()) {
+      return `${basePrompt}\n\n${systemPromptAddition.trim()}`;
+    }
+
+    return basePrompt;
+  }, [currentLocale, toolsMode, actualToolsSchema, systemPromptAddition, loadedStaticResources]);
+
+  const conversationHistoryRef = useRef([{ role: "system", content: systemPrompt }]);
+
+  useEffect(() => {
+    if (
+      Array.isArray(conversationHistoryRef.current) &&
+      conversationHistoryRef.current.length > 0 &&
+      conversationHistoryRef.current[0] &&
+      conversationHistoryRef.current[0].role === 'system'
+    ) {
+      conversationHistoryRef.current[0] = { role: 'system', content: systemPrompt };
+    }
+  }, [systemPrompt]);
 
   // Load static resources on mount and add to context (ONCE)
   useEffect(() => {
@@ -723,6 +809,9 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
 
   // Load chat history from IndexedDB on mount
   useEffect(() => {
+    let cancelled = false;
+    let timeoutId = null;
+
     const loadChatHistory = async () => {
       // Skip if already loaded or persistence is disabled
       if (historyLoadedRef.current || !persistChatHistory) {
@@ -730,33 +819,29 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
       }
 
       try {
-        // Set loading flag to prevent notification popup for loaded messages
         setIsLoadingHistory(true);
         
-        // Generate storage key using normalizedConfigs
         storageKeyRef.current = generateStorageKey(normalizedConfigs);
         
         if (debug) {
           console.info('[Debug] ChatHistory: Loading chat history for key:', storageKeyRef.current);
         }
         
-        // Load messages from IndexedDB
         const loadedMessages = await loadMessages(
           storageKeyRef.current, 
           historyDepthHours, 
           maxContextSize
         );
 
+        if (cancelled) return;
+
         if (loadedMessages && loadedMessages.length > 0) {
-          // Filter messages by context size
           const systemMessage = { role: 'system', content: systemPrompt };
           const historyWithSystem = [systemMessage, ...loadedMessages];
           const { filtered, allMessages } = filterMessagesByContext(historyWithSystem, maxContextSize);
           
-          // Update conversation history with filtered messages
           conversationHistoryRef.current = filtered;
           
-          // Update UI messages (exclude system messages)
           const uiMessages = allMessages.filter(msg => msg.role !== 'system');
           setMessages(uiMessages);
           
@@ -764,7 +849,6 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
             console.info(`[Debug] ChatHistory: Loaded ${loadedMessages.length} messages from history`);
           }
         } else {
-          // No history found - initialize with system message
           conversationHistoryRef.current = [{ role: 'system', content: systemPrompt }];
           if (debug) {
             console.info('[Debug] ChatHistory: No history found, starting fresh');
@@ -773,69 +857,29 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
         
         historyLoadedRef.current = true;
         
-        // Reset loading flag after a small delay to ensure UI has updated
-        setTimeout(() => {
-          setIsLoadingHistory(false);
+        timeoutId = setTimeout(() => {
+          if (!cancelled) setIsLoadingHistory(false);
         }, 100);
       } catch (error) {
         if (debug) {
           console.error('[Debug] ChatHistory: Error loading chat history:', error);
         }
-        // On error, initialize with system message
         conversationHistoryRef.current = [{ role: 'system', content: systemPrompt }];
         historyLoadedRef.current = true;
-        setIsLoadingHistory(false);
+        if (!cancelled) setIsLoadingHistory(false);
       }
     };
 
-    // Load history after system prompt is ready
     if (systemPrompt && !historyLoadedRef.current) {
       loadChatHistory();
     }
+
+    return () => {
+      cancelled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+    };
   }, [systemPrompt, persistChatHistory, historyDepthHours, maxContextSize, modelName, baseUrl, apiKey]);
 
-  // System prompt with localization (recomputed when tools or locale/mode change)
-  // toolsMode: 'api' = tools passed via API parameter only (standard)
-  // toolsMode: 'prompt' = tools passed via API parameter AND described in system prompt (legacy)
-  const systemPrompt = useMemo(() => {
-    let basePrompt;
-    if (toolsMode === 'prompt') {
-      const toolsList = (actualToolsSchema || [])
-        .map(t => `• ${t.function.name}: ${t.function.description}`)
-        .join('\n');
-      basePrompt = (currentLocale.systemPromptWithTools || currentLocale.systemPrompt)
-        .replace('{toolsList}', toolsList);
-    } else {
-      basePrompt = currentLocale.systemPrompt;
-    }
-    
-    // Append static resources context (loaded data available to AI)
-    if (loadedStaticResources) {
-      basePrompt = `${basePrompt}${loadedStaticResources}`;
-    }
-    
-    // Append custom system prompt addition if provided
-    if (systemPromptAddition && typeof systemPromptAddition === 'string' && systemPromptAddition.trim()) {
-      return `${basePrompt}\n\n${systemPromptAddition.trim()}`;
-    }
-    
-    return basePrompt;
-  }, [currentLocale, toolsMode, actualToolsSchema, systemPromptAddition, loadedStaticResources]);
-
-
-  const conversationHistoryRef = useRef([{ role: "system", content: systemPrompt }]);
-
-  // Keep the first system message in sync when the computed systemPrompt changes
-  useEffect(() => {
-    if (
-      Array.isArray(conversationHistoryRef.current) &&
-      conversationHistoryRef.current.length > 0 &&
-      conversationHistoryRef.current[0] &&
-      conversationHistoryRef.current[0].role === 'system'
-    ) {
-      conversationHistoryRef.current[0] = { role: 'system', content: systemPrompt };
-    }
-  }, [systemPrompt]);
   const isProcessingRef = useRef(false);
   const usedFollowUpRef = useRef(false);
 
@@ -878,8 +922,10 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     return tools;
   }, [actualToolsSchema, dynamicResourceTool]);
   
-  // Use provided tools + resource tool
-  const availableTools = new Set(extendedToolsSchema.map(t => t.function.name));
+  const availableTools = useMemo(
+    () => new Set((extendedToolsSchema || []).map(t => t.function.name)),
+    [extendedToolsSchema]
+  );
 
   const clearChat = useCallback(async () => {
     setMessages([]);
@@ -904,6 +950,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
   }, [systemPrompt, persistChatHistory]);
 
   const handleToolCalls = useCallback(async (toolCallsArray) => {
+    const genAtStart = requestGenRef.current;
     setIsExecutingTools(true);
     const toolResponses = [];
 
@@ -968,7 +1015,15 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
           if (result.contents && Array.isArray(result.contents) && result.contents.length > 0) {
             // Spec-compliant format: { contents: [{ uri, mimeType, text }] }
             const content = result.contents[0];
-            data = content.text ? JSON.parse(content.text) : content;
+            if (content.text) {
+              try {
+                data = JSON.parse(content.text);
+              } catch (_) {
+                data = content.text;
+              }
+            } else {
+              data = content;
+            }
           } else if (result.data) {
             // Legacy format: { success: true, data: {...} }
             data = result.data;
@@ -1048,16 +1103,25 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     }
 
     if (debug) {
+      const hasError = (r) => {
+        try {
+          return !!JSON.parse(r.content).error;
+        } catch (_) {
+          return false;
+        }
+      };
       console.log('[Debug] Tool Calls Completed:', {
         totalCalls: toolCallsArray.length,
-        successfulResponses: toolResponses.filter(r => !JSON.parse(r.content).error).length,
-        failedResponses: toolResponses.filter(r => JSON.parse(r.content).error).length
+        successfulResponses: toolResponses.filter(r => !hasError(r)).length,
+        failedResponses: toolResponses.filter(hasError).length
       });
     }
 
     return toolResponses;
     } finally {
-      setIsExecutingTools(false);
+      if (requestGenRef.current === genAtStart) {
+        setIsExecutingTools(false);
+      }
     }
   }, [mcpClient, actualToolsSchema, currentLocale, availableTools, debug, onToolError]);
 
@@ -1102,7 +1166,8 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     const response = await fetch(`${actualBaseUrl}/chat/completions`, {
       method: 'POST',
       headers: headers,
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify(requestBody),
+      signal: options.signal
     });
 
     if (!response.ok) {
@@ -1192,7 +1257,8 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     const response = await fetch(`${actualBaseUrl}/chat/completions`, {
       method: 'POST',
       headers: headers,
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify(requestBody),
+      signal: options.signal
     });
 
     if (!response.ok) {
@@ -1224,12 +1290,24 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     }
 
     // Handle streaming response
+    if (!response.body) {
+      throw new Error('Streaming response body is empty');
+    }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    const onAbort = () => {
+      try { reader.cancel(); } catch (_) { /* no-op */ }
+    };
+    options.signal?.addEventListener('abort', onAbort);
 
     try {
       while (true) {
+        if (options.signal?.aborted) {
+          const err = new Error('Aborted');
+          err.name = 'AbortError';
+          throw err;
+        }
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -1255,12 +1333,14 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
         }
       }
     } finally {
-      reader.releaseLock();
+      options.signal?.removeEventListener('abort', onAbort);
+      try { await reader.cancel(); } catch (_) { /* no-op */ }
+      try { reader.releaseLock(); } catch (_) { /* no-op */ }
     }
   }, [modelName, baseUrl, apiKey, extendedToolsSchema, currentLocale, toolsMode, debug]);
 
   // Optional validator: checks assistant display content and can warn or request a revision
-  const validateAssistantContent = useCallback(async (assistantText) => {
+  const validateAssistantContent = useCallback(async (assistantText, options = {}) => {
     try {
       if (!validationOptions || !validationOptions.enabled) return { valid: true };
       const mode = validationOptions.mode === 'revise' ? 'revise' : 'warn';
@@ -1277,7 +1357,10 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
         { role: 'user', content: `Assistant reply to validate:\n\n\n${assistantText}` }
       ];
 
-      const res = await callOpenAI(validationHistory, { toolsOverride: [], toolChoiceOverride: 'none' });
+      const res = await callOpenAI(validationHistory, { toolsOverride: [], toolChoiceOverride: 'none', signal: options.signal });
+      if (userCancelledRef.current || options.signal?.aborted) {
+        return { valid: true };
+      }
       const msg = res.choices?.[0]?.message;
       const raw = msg?.content || '';
       let verdict;
@@ -1288,6 +1371,9 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
         return { valid: true };
       }
       if (verdict && verdict.valid === false) {
+        if (userCancelledRef.current || options.signal?.aborted) {
+          return { valid: true };
+        }
         if (mode === 'warn') {
           const note = typeof verdict.note === 'string' ? verdict.note : 'Validation failed.';
           const warnText = locale === 'ru' ? `⚠️ Проверка ответа: ${note}` : (locale === 'zh' ? `⚠️ 校验提示：${note}` : `⚠️ Validation: ${note}`);
@@ -1310,542 +1396,201 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     }
   }, [validationOptions, locale, callOpenAI]);
 
-  const sendMessage = useCallback(async (userMessage) => {
+  const sendWithMode = useCallback(async (userMessage, { streaming } = { streaming: false }) => {
     if (!userMessage.trim() || isLoading || isProcessingRef.current) {
       return;
     }
 
-    // Store original message for potential retry with fallback
     const originalUserMessage = userMessage;
-    
     isProcessingRef.current = true;
+    requestGenRef.current += 1;
+    const myGen = requestGenRef.current;
+    userCancelledRef.current = false;
     setIsLoading(true);
+    if (streaming) {
+      setIsStreaming(true);
+      setStreamingMessage(null);
+    }
     setError(null);
 
-    let uiMessages; // Declare once for reuse throughout the function
+    abortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    const { signal } = abortController;
+
+    const retryInstruction = locale === 'ru'
+      ? 'Предыдущий ответ содержал неверный JSON вида {"": {}}. Сформируй корректный ответ: либо понятный текст для пользователя, либо корректные tool_calls.'
+      : (locale === 'zh'
+        ? '上一次回复包含无效的 JSON（{"": {}}）。请生成正确的回复：要么是用户可读的文本，要么是标准的 tool_calls。'
+        : 'Previous reply contained invalid JSON of the form {"": {}}. Generate a correct reply: either a user-facing message or proper tool_calls.');
+    const convertInstruction = locale === 'ru'
+      ? 'Преобразуй свой предыдущий ответ в корректный формат tool_calls OpenAI без <|...|> тегов. Верни только tool_calls.'
+      : (locale === 'zh'
+        ? '将你之前的回复转换为没有 <|...|> 标签的标准 OpenAI tool_calls 格式。只返回 tool_calls。'
+        : 'Convert your previous reply into proper OpenAI tool_calls format without <|...|> tags. Return tool_calls only.');
+    const followupInstruction = locale === 'ru'
+      ? 'Сформулируй краткий, конкретный вопрос пользователю о недостающих данных/доступах, необходимых для продолжения. Без тегов <think> и без кода. Одна короткая фраза.'
+      : 'Write a brief, specific question to the user asking for the exact missing info or access required to proceed. No <think> tags, no code. One concise sentence.';
+
+    const throwIfCancelled = () => {
+      if (userCancelledRef.current || signal.aborted) {
+        const err = new Error('Aborted');
+        err.name = 'AbortError';
+        throw err;
+      }
+    };
 
     try {
       if (conversationHistoryRef.current.length > 0 && conversationHistoryRef.current[0]?.role === 'system') {
         conversationHistoryRef.current[0] = { role: 'system', content: systemPrompt };
       }
-      // Add user message
-      const userMsgObj = { role: "user", content: originalUserMessage };
-      conversationHistoryRef.current.push(userMsgObj);
-      
-      // Update UI messages with exclusion flags
+      turnStartIndexRef.current = conversationHistoryRef.current.length;
+      inFlightUserMessageRef.current = originalUserMessage;
+      conversationHistoryRef.current.push({ role: 'user', content: originalUserMessage });
+
       const { allMessages: initialMessages } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
-      // Filter out all system messages from UI (they should not be displayed to user)
-      uiMessages = initialMessages.filter(msg => msg.role !== 'system');
-      setMessages(uiMessages);
-      
+      setMessages(initialMessages.filter(msg => msg.role !== 'system'));
+
       usedFollowUpRef.current = false;
 
       let loopCount = 0;
       const MAX_LOOPS = maxToolLoops;
-
-      // One-shot retry for control-tag responses
       const usedControlTagRetryRef = { current: false };
-      // One-shot retry for invalid empty-key JSON like {"": {}}
       const usedEmptyJsonRetryRef = { current: false };
+      let completed = false;
 
       while (loopCount < MAX_LOOPS) {
+        throwIfCancelled();
         loopCount++;
-
-        // Filter messages by context size for API call
         const { filtered } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
+        let assistantMsg;
 
-        // Call OpenAI API with filtered messages only
-        const response = await callOpenAI(filtered);
-        const assistantMsg = response.choices[0].message;
+        if (streaming) {
+          setStreamingMessage({ role: 'assistant', content: '' });
+          let accumulatedContent = '';
+          let toolCalls = null;
 
-        // Detect invalid content: { "": {} }
-        let isEmptyKeyEmptyObject = false;
-        try {
-          const raw = typeof assistantMsg.content === 'string' ? assistantMsg.content.trim() : '';
-          if (raw.startsWith('{') && raw.endsWith('}')) {
-            const obj = JSON.parse(raw);
-            if (obj && typeof obj === 'object') {
-              const keys = Object.keys(obj);
-              if (keys.length === 1 && keys[0] === '' && obj[''] && typeof obj[''] === 'object' && Object.keys(obj['']).length === 0) {
-                isEmptyKeyEmptyObject = true;
-              }
+          await callOpenAIStream(filtered, { signal }, (delta) => {
+            if (userCancelledRef.current || signal.aborted) {
+              return;
             }
-          }
-        } catch (_) {}
-
-        if (isEmptyKeyEmptyObject && !usedEmptyJsonRetryRef.current) {
-          usedEmptyJsonRetryRef.current = true;
-          const retryInstruction = locale === 'ru'
-            ? 'Предыдущий ответ содержал неверный JSON вида {"": {}}. Сформируй корректный ответ: либо понятный текст для пользователя, либо корректные tool_calls.'
-            : (locale === 'zh'
-              ? '上一次回复包含无效的 JSON（{"": {}}）。请生成正确的回复：要么是用户可读的文本，要么是标准的 tool_calls。'
-              : 'Previous reply contained invalid JSON of the form {"": {}}. Generate a correct reply: either a user-facing message or proper tool_calls.');
-          const retryMsg = { role: 'system', content: retryInstruction };
-          conversationHistoryRef.current.push(retryMsg);
-          const retryRes = await callOpenAI(conversationHistoryRef.current);
-          const retryAssistant = retryRes.choices?.[0]?.message || { role: 'assistant', content: '' };
-          conversationHistoryRef.current.push(retryAssistant);
-          const retryParsed = parseAssistantResponse(retryAssistant, availableTools);
-          // If we obtained tool calls, process them and continue loop
-          if (retryParsed.toolCallsJson?.length) {
-            const toolResponses = await handleToolCalls(retryParsed.toolCallsJson);
-            if (toolResponses.length !== retryParsed.toolCallsJson.length) {
-              const forcedResponses = retryParsed.toolCallsJson.map((call, index) => {
-                if (index < toolResponses.length) return toolResponses[index];
-                return { role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: currentLocale.toolResponseError }) };
+            if (delta.content) {
+              accumulatedContent += delta.content;
+              setStreamingMessage(prev => ({
+                ...prev,
+                content: accumulatedContent
+              }));
+            }
+            if (delta.tool_calls) {
+              if (!toolCalls) toolCalls = [];
+              delta.tool_calls.forEach(tc => {
+                const existingIndex = toolCalls.findIndex(t => t.index === tc.index);
+                if (existingIndex >= 0) {
+                  if (tc.function) {
+                    if (!toolCalls[existingIndex].function) {
+                      toolCalls[existingIndex].function = {};
+                    }
+                    if (tc.function.name) {
+                      toolCalls[existingIndex].function.name = tc.function.name;
+                    }
+                    if (tc.function.arguments) {
+                      toolCalls[existingIndex].function.arguments =
+                        (toolCalls[existingIndex].function.arguments || '') + tc.function.arguments;
+                    }
+                  }
+                  if (tc.id) {
+                    toolCalls[existingIndex].id = tc.id;
+                  }
+                  if (!toolCalls[existingIndex].type) {
+                    toolCalls[existingIndex].type = 'function';
+                  }
+                } else {
+                  toolCalls.push({
+                    type: 'function',
+                    index: tc.index,
+                    id: tc.id || generateToolCallId(),
+                    function: tc.function || {}
+                  });
+                }
               });
-              conversationHistoryRef.current.push(...forcedResponses);
-            } else {
-              conversationHistoryRef.current.push(...toolResponses);
             }
-            continue;
-          }
-          // Otherwise, if we got displayable content, show it and validate, then break
-          if ((retryParsed.displayContent || '').trim()) {
-            setMessages(prev => [...prev, { role: 'assistant', content: retryParsed.displayContent }]);
-            await validateAssistantContent(retryParsed.displayContent);
-            break;
-          }
-          // If still nothing useful, continue loop to try again (bounded by MAX_LOOPS)
-          continue;
-        }
+          });
 
-        // Parse response
-        const parsed = parseAssistantResponse(assistantMsg, availableTools);
-
-        // Add to history
-        conversationHistoryRef.current.push(assistantMsg);
-
-        // Add displayable content or tool-calls placeholder for UI
-        if (parsed.displayContent.trim()) {
-          setMessages(prev => [...prev, {
-            role: "assistant",
-            content: parsed.displayContent
-          }]);
-          // Optionally validate the assistant display content
-          await validateAssistantContent(parsed.displayContent);
-        } else if (parsed.toolCallsJson?.length) {
-          // Show that assistant is calling tools (UI renders list from tool_calls)
-          const uiToolCalls = parsed.toolCallsJson.map(tc => ({
-            function: { name: tc.name }
-          }));
-          setMessages(prev => [...prev, {
-            role: "assistant",
-            tool_calls: uiToolCalls
-          }]);
-        }
-
-        // Process tool calls
-        if (parsed.toolCallsJson?.length) {
-          // Execute tools
-          const toolResponses = await handleToolCalls(parsed.toolCallsJson);
-
-          // Check response count
-          if (toolResponses.length !== parsed.toolCallsJson.length) {
-            // Force responses for each call
-            const forcedResponses = parsed.toolCallsJson.map((call, index) => {
-              if (index < toolResponses.length) {
-                return toolResponses[index];
-              }
-              return {
-                role: "tool",
-                tool_call_id: call.id,
-                content: JSON.stringify({ error: currentLocale.toolResponseError })
-              };
-            });
-
-            // Add forced responses
-            conversationHistoryRef.current.push(...forcedResponses);
-          } else {
-            // Add tool responses to history
-            conversationHistoryRef.current.push(...toolResponses);
-          }
+          assistantMsg = {
+            role: 'assistant',
+            content: accumulatedContent,
+            ...(toolCalls && { tool_calls: toolCalls })
+          };
         } else {
-          // If model returned gpt-oss control tags without parsed tool calls, request conversion once
-          const contentStr = typeof assistantMsg.content === 'string' ? assistantMsg.content : '';
-          const hasControlTags = /<\|constrain\|>|<\|message\|>|<\|channel\|>/i.test(contentStr);
-          if (hasControlTags && !usedControlTagRetryRef.current) {
-            usedControlTagRetryRef.current = true;
-            const convertInstruction = locale === 'ru'
-              ? 'Преобразуй свой предыдущий ответ в корректный формат tool_calls OpenAI без <|...|> тегов. Верни только tool_calls.'
-              : (locale === 'zh'
-                ? '将你之前的回复转换为没有 <|...|> 标签的标准 OpenAI tool_calls 格式。只返回 tool_calls。'
-                : 'Convert your previous reply into proper OpenAI tool_calls format without <|...|> tags. Return tool_calls only.');
-            const convertMsg = { role: 'system', content: convertInstruction };
-            conversationHistoryRef.current.push(convertMsg);
-            const convertRes = await callOpenAI(conversationHistoryRef.current);
-            const convertAssistant = convertRes.choices?.[0]?.message || { role: 'assistant', content: '' };
-            conversationHistoryRef.current.push(convertAssistant);
-            const convParsed = parseAssistantResponse(convertAssistant, availableTools);
-            if (convParsed.toolCallsJson?.length) {
-              // Execute tools obtained from conversion
-              const toolResponses = await handleToolCalls(convParsed.toolCallsJson);
-              if (toolResponses.length !== convParsed.toolCallsJson.length) {
-                const forcedResponses = convParsed.toolCallsJson.map((call, index) => {
-                  if (index < toolResponses.length) {
-                    return toolResponses[index];
-                  }
-                  return {
-                    role: 'tool',
-                    tool_call_id: call.id,
-                    content: JSON.stringify({ error: currentLocale.toolResponseError })
-                  };
-                });
-                conversationHistoryRef.current.push(...forcedResponses);
-              } else {
-                conversationHistoryRef.current.push(...toolResponses);
-              }
-              // Continue loop to let model use tool results
-              continue;
-            }
-          }
-          // No tool calls. If there is no displayable content either, ask model to formulate a user-facing question once.
-          if (!parsed.displayContent || !parsed.displayContent.trim()) {
-            if (!usedFollowUpRef.current) {
-              usedFollowUpRef.current = true;
-              const followupInstruction = locale === 'ru'
-                ? 'Сформулируй краткий, конкретный вопрос пользователю о недостающих данных/доступах, необходимых для продолжения. Без тегов <think> и без кода. Одна короткая фраза.'
-                : 'Write a brief, specific question to the user asking for the exact missing info or access required to proceed. No <think> tags, no code. One concise sentence.';
-
-              const followupMsg = { role: 'system', content: followupInstruction };
-              conversationHistoryRef.current.push(followupMsg);
-              const followupRes = await callOpenAI(conversationHistoryRef.current);
-              const followupAssistant = followupRes.choices?.[0]?.message || { role: 'assistant', content: '' };
-              conversationHistoryRef.current.push(followupAssistant);
-              const followParsed = parseAssistantResponse(followupAssistant, availableTools);
-              const followText = (followParsed.displayContent || '').trim();
-              if (followText) {
-                setMessages(prev => [...prev, { role: 'assistant', content: followText }]);
-              }
-            }
-          }
-          break;
+          const response = await callOpenAI(filtered, { signal });
+          assistantMsg = response.choices[0].message;
         }
-      }
 
-      if (loopCount >= MAX_LOOPS) {
-        throw new Error(currentLocale.loopLimitReached);
-      }
-      
-      // Update UI messages with exclusion flags after loop completes
-      const { allMessages } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
-      // Filter out all system messages from UI (they should not be displayed to user)
-      uiMessages = allMessages.filter(msg => msg.role !== 'system');
-      setMessages(uiMessages);
-      
-      // Save messages to IndexedDB
-      if (persistChatHistory && storageKeyRef.current) {
-        try {
-          await saveMessages(storageKeyRef.current, conversationHistoryRef.current, maxContextSize);
-        } catch (error) {
-          if (debug) {
-            console.error('[Debug] ChatHistory: Error saving messages:', error);
-          }
-        }
-      }
-      
-      // Reset to first config on success
-      if (currentConfigIndex !== 0) {
-        if (debug) {
-          console.info('[Debug] LLM Fallback: Request successful. Resetting to primary config.');
-        }
-        setCurrentConfigIndex(0);
-      }
-    } catch (err) {
-      // Try fallback to next config if available
-      if (currentConfigIndex < normalizedConfigs.length - 1) {
-        if (debug) {
-          console.warn(`[Debug] LLM Fallback: Config ${currentConfigIndex} (${normalizedConfigs[currentConfigIndex].modelName}) failed: ${err.message}. Trying next config...`);
-        }
-        
-        // Remove the user message from history since we'll retry
-        if (conversationHistoryRef.current.length > 0 && 
-            conversationHistoryRef.current[conversationHistoryRef.current.length - 1].role === 'user') {
-          conversationHistoryRef.current.pop();
-        }
-        
-        // Store message for retry
-        retryMessageRef.current = originalUserMessage;
-        isRetryingRef.current = true;
-        
-        // Reset state
-        setError(null);
-        isProcessingRef.current = false;
-        setIsLoading(false);
-        
-        // Switch to next config (this will trigger useEffect to retry)
-        setCurrentConfigIndex(prev => prev + 1);
-        return;
-      }
-      
-      // All configs failed - show error
-      if (debug) {
-        console.error(`[Debug] LLM Fallback: All configs failed. Last error: ${err.message}`);
-      }
-      setError(err.message);
+        throwIfCancelled();
 
-      const errorMsg = {
-        role: "assistant",
-        content: currentLocale.errorMessage.replace('{message}', err.message)
-      };
-
-      conversationHistoryRef.current.push(errorMsg);
-      
-      // Update UI messages with exclusion flags after error
-      const { allMessages } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
-      // Filter out all system messages from UI (they should not be displayed to user)
-      uiMessages = allMessages.filter(msg => msg.role !== 'system');
-      setMessages(uiMessages);
-    } finally {
-      // Only clean up if not retrying with fallback
-      if (!(currentConfigIndex < normalizedConfigs.length - 1 && error)) {
-        setIsLoading(false);
-        isProcessingRef.current = false;
-      }
-    }
-  }, [isLoading, callOpenAI, handleToolCalls, actualToolsSchema, currentLocale, maxContextSize, persistChatHistory, currentConfigIndex, normalizedConfigs, error, systemPrompt]);
-
-  // Streaming version of sendMessage
-  const sendMessageStream = useCallback(async (userMessage) => {
-    if (!userMessage.trim() || isLoading || isProcessingRef.current) {
-      return;
-    }
-
-    // Store original message for potential retry with fallback
-    const originalUserMessage = userMessage;
-    
-    isProcessingRef.current = true;
-    setIsLoading(true);
-    setIsStreaming(true);
-    setError(null);
-    setStreamingMessage(null);
-
-    let uiMessages; // Declare once for reuse throughout the function
-
-    try {
-      if (conversationHistoryRef.current.length > 0 && conversationHistoryRef.current[0]?.role === 'system') {
-        conversationHistoryRef.current[0] = { role: 'system', content: systemPrompt };
-      }
-      // Add user message
-      const userMsgObj = { role: "user", content: originalUserMessage };
-      conversationHistoryRef.current.push(userMsgObj);
-      
-      // Update UI messages with exclusion flags
-      const { allMessages: initialMessages } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
-      // Filter out all system messages from UI (they should not be displayed to user)
-      uiMessages = initialMessages.filter(msg => msg.role !== 'system');
-      setMessages(uiMessages);
-      
-      usedFollowUpRef.current = false;
-
-      let loopCount = 0;
-      const MAX_LOOPS = maxToolLoops;
-
-      // One-shot retry for control-tag responses
-      const usedControlTagRetryRef = { current: false };
-      // One-shot retry for invalid empty-key JSON like {"": {}}
-      const usedEmptyJsonRetryRef = { current: false };
-
-      while (loopCount < MAX_LOOPS) {
-        loopCount++;
-
-        // Filter messages by context size for API call
-        const { filtered } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
-
-        // Initialize streaming message for this iteration
-        const initialStreamingMsg = { role: "assistant", content: "" };
-        setStreamingMessage(initialStreamingMsg);
-
-        // Handle streaming response
-        let accumulatedContent = "";
-        let toolCalls = null;
-
-        await callOpenAIStream(filtered, {}, (delta) => {
-          if (delta.content) {
-            accumulatedContent += delta.content;
-            setStreamingMessage(prev => ({
-              ...prev,
-              content: accumulatedContent
-            }));
-          }
-          
-          // Handle reasoning_content (thinking) - don't display
-          if (delta.reasoning_content) {
-            // Silently ignore reasoning content
-          }
-          
-          if (delta.tool_calls) {
-            if (!toolCalls) toolCalls = [];
-            delta.tool_calls.forEach(tc => {
-              const existingIndex = toolCalls.findIndex(t => t.index === tc.index);
-              if (existingIndex >= 0) {
-                // Update existing tool call
-                if (tc.function) {
-                  if (!toolCalls[existingIndex].function) {
-                    toolCalls[existingIndex].function = {};
-                  }
-                  // Accumulate name
-                  if (tc.function.name) {
-                    toolCalls[existingIndex].function.name = tc.function.name;
-                  }
-                  // Accumulate arguments as string (streaming comes in parts)
-                  if (tc.function.arguments) {
-                    toolCalls[existingIndex].function.arguments = 
-                      (toolCalls[existingIndex].function.arguments || '') + tc.function.arguments;
-                  }
-                }
-                // Add id if provided
-                if (tc.id) {
-                  toolCalls[existingIndex].id = tc.id;
-                }
-                // Ensure type is set
-                if (!toolCalls[existingIndex].type) {
-                  toolCalls[existingIndex].type = "function";
-                }
-              } else {
-                // Create new tool call
-                toolCalls.push({
-                  type: "function",
-                  index: tc.index,
-                  id: tc.id || generateToolCallId(),
-                  function: tc.function || {}
-                });
-              }
-            });
-          }
-        });
-
-        // Finalize the message
-        const finalMessage = {
-          role: "assistant",
-          content: accumulatedContent,
-          ...(toolCalls && { tool_calls: toolCalls })
-        };
-
-        // Detect invalid content: { "": {} }
-        let isEmptyKeyEmptyObject = false;
-        try {
-          const raw = typeof finalMessage.content === 'string' ? finalMessage.content.trim() : '';
-          if (raw.startsWith('{') && raw.endsWith('}')) {
-            const obj = JSON.parse(raw);
-            if (obj && typeof obj === 'object') {
-              const keys = Object.keys(obj);
-              if (keys.length === 1 && keys[0] === '' && obj[''] && typeof obj[''] === 'object' && Object.keys(obj['']).length === 0) {
-                isEmptyKeyEmptyObject = true;
-              }
-            }
-          }
-        } catch (_) {}
-
-        if (isEmptyKeyEmptyObject && !usedEmptyJsonRetryRef.current) {
+        if (isEmptyKeyEmptyObjectContent(assistantMsg.content) && !usedEmptyJsonRetryRef.current) {
           usedEmptyJsonRetryRef.current = true;
-          const retryInstruction = locale === 'ru'
-            ? 'Предыдущий ответ содержал неверный JSON вида {"": {}}. Сформируй корректный ответ: либо понятный текст для пользователя, либо корректные tool_calls.'
-            : (locale === 'zh'
-              ? '上一次回复包含无效的 JSON（{"": {}}）。请生成正确的回复：要么是用户可读的文本，要么是标准的 tool_calls。'
-              : 'Previous reply contained invalid JSON of the form {"": {}}. Generate a correct reply: either a user-facing message or proper tool_calls.');
-          const retryMsg = { role: 'system', content: retryInstruction };
-          conversationHistoryRef.current.push(retryMsg);
-          continue; // Retry with the instruction
-        }
-
-        // Parse the message to handle tool calls properly
-        const parsed = parseAssistantResponse(finalMessage, availableTools);
-
-        // Add to conversation history
-        conversationHistoryRef.current.push(finalMessage);
-
-        // Process tool calls first
-        if (parsed.toolCallsJson?.length) {
-          // Execute tools
-          const toolResponses = await handleToolCalls(parsed.toolCallsJson);
-
-          // Check response count
-          if (toolResponses.length !== parsed.toolCallsJson.length) {
-            // Force responses for each call
-            const forcedResponses = parsed.toolCallsJson.map((call, index) => {
-              if (index < toolResponses.length) {
-                return toolResponses[index];
-              }
-              return {
-                role: "tool",
-                tool_call_id: call.id,
-                content: JSON.stringify({ error: currentLocale.toolResponseError })
-              };
-            });
-
-            // Add forced responses
-            conversationHistoryRef.current.push(...forcedResponses);
-          } else {
-            // Add tool responses to history
-            conversationHistoryRef.current.push(...toolResponses);
-          }
-
-          // Show tool calls in UI (for user feedback)
-          const uiToolCalls = parsed.toolCallsJson.map(tc => ({
-            type: "function",
-            function: { name: tc.name }
-          }));
-          setMessages(prev => [...prev, {
-            role: "assistant",
-            tool_calls: uiToolCalls
-          }]);
-
-          // Continue loop to let model use tool results
+          conversationHistoryRef.current.push({ role: 'system', content: retryInstruction });
           continue;
-        } else {
-          // No tool calls - add displayable content to UI
-          if (parsed.displayContent.trim()) {
-            setMessages(prev => [...prev, {
-              role: "assistant",
-              content: parsed.displayContent
-            }]);
-            // Optionally validate the assistant display content
-            await validateAssistantContent(parsed.displayContent);
-          }
-          // If model returned gpt-oss control tags without parsed tool calls, request conversion once
-          const contentStr = typeof finalMessage.content === 'string' ? finalMessage.content : '';
-          const hasControlTags = /<\|constrain\|>|<\|message\|>|<\|channel\|>/i.test(contentStr);
-          if (hasControlTags && !usedControlTagRetryRef.current) {
-            usedControlTagRetryRef.current = true;
-            const convertInstruction = locale === 'ru'
-              ? 'Преобразуй свой предыдущий ответ в корректный формат tool_calls OpenAI без <|...|> тегов. Верни только tool_calls.'
-              : (locale === 'zh'
-                ? '将你之前的回复转换为没有 <|...|> 标签的标准 OpenAI tool_calls 格式。只返回 tool_calls。'
-                : 'Convert your previous reply into proper OpenAI tool_calls format without <|...|> tags. Return tool_calls only.');
-            const convertMsg = { role: 'system', content: convertInstruction };
-            conversationHistoryRef.current.push(convertMsg);
-            continue; // Retry with the instruction
-          }
-          
-          // No tool calls. If there is no displayable content either, ask model to formulate a user-facing question once.
-          if (!parsed.displayContent || !parsed.displayContent.trim()) {
-            if (!usedFollowUpRef.current) {
-              usedFollowUpRef.current = true;
-              const followupInstruction = locale === 'ru'
-                ? 'Сформулируй краткий, конкретный вопрос пользователю о недостающих данных/доступах, необходимых для продолжения. Без тегов <think> и без кода. Одна короткая фраза.'
-                : 'Write a brief, specific question to the user asking for the exact missing info or access required to proceed. No <think> tags, no code. One concise sentence.';
-
-              const followupMsg = { role: 'system', content: followupInstruction };
-              conversationHistoryRef.current.push(followupMsg);
-              continue; // Retry with the instruction
-            }
-          }
-          break;
         }
+
+        const parsed = parseAssistantResponse(assistantMsg, availableTools);
+        conversationHistoryRef.current.push(toHistoryAssistantMessage(assistantMsg, parsed));
+
+        if (parsed.toolCallsJson?.length) {
+          const toolResponses = await handleToolCalls(parsed.toolCallsJson);
+          throwIfCancelled();
+          conversationHistoryRef.current.push(...toolResponses);
+
+          if ((parsed.displayContent || '').trim()) {
+            setMessages(prev => [...prev, { role: 'assistant', content: parsed.displayContent }]);
+            await validateAssistantContent(parsed.displayContent, { signal });
+            throwIfCancelled();
+          } else {
+            setMessages(prev => [...prev, {
+              role: 'assistant',
+              tool_calls: parsed.toolCallsJson.map(tc => ({ function: { name: tc.name } }))
+            }]);
+          }
+          continue;
+        }
+
+        if ((parsed.displayContent || '').trim()) {
+          setMessages(prev => [...prev, { role: 'assistant', content: parsed.displayContent }]);
+          await validateAssistantContent(parsed.displayContent, { signal });
+          throwIfCancelled();
+        }
+
+        const contentStr = typeof assistantMsg.content === 'string' ? assistantMsg.content : '';
+        const hasControlTags = /<\|constrain\|>|<\|message\|>|<\|channel\|>/i.test(contentStr);
+        if (hasControlTags && !usedControlTagRetryRef.current) {
+          usedControlTagRetryRef.current = true;
+          conversationHistoryRef.current.push({ role: 'system', content: convertInstruction });
+          continue;
+        }
+
+        if (!(parsed.displayContent || '').trim() && !usedFollowUpRef.current) {
+          usedFollowUpRef.current = true;
+          conversationHistoryRef.current.push({ role: 'system', content: followupInstruction });
+          continue;
+        }
+
+        completed = true;
+        break;
       }
 
-      if (loopCount >= MAX_LOOPS) {
+      if (!completed) {
         throw new Error(currentLocale.loopLimitReached);
       }
-      
-      // Update UI messages with exclusion flags after loop completes
+
+      throwIfCancelled();
+
+      turnStartIndexRef.current = null;
+      inFlightUserMessageRef.current = null;
+
       const { allMessages } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
-      // Filter out all system messages from UI (they should not be displayed to user)
-      uiMessages = allMessages.filter(msg => msg.role !== 'system');
-      setMessages(uiMessages);
-      
-      // Save messages to IndexedDB
+      setMessages(allMessages.filter(msg => msg.role !== 'system'));
+
       if (persistChatHistory && storageKeyRef.current) {
         try {
           await saveMessages(storageKeyRef.current, conversationHistoryRef.current, maxContextSize);
@@ -1855,77 +1600,106 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
           }
         }
       }
-      
-      // Reset to first config on success
+
       if (currentConfigIndex !== 0) {
         if (debug) {
           console.info('[Debug] LLM Fallback: Request successful. Resetting to primary config.');
         }
         setCurrentConfigIndex(0);
       }
-
     } catch (err) {
-      // Try fallback to next config if available
+      if (err?.name === 'AbortError' || userCancelledRef.current) {
+        return;
+      }
+
       if (currentConfigIndex < normalizedConfigs.length - 1) {
         if (debug) {
           console.warn(`[Debug] LLM Fallback: Config ${currentConfigIndex} (${normalizedConfigs[currentConfigIndex].modelName}) failed: ${err.message}. Trying next config...`);
         }
-        
-        // Remove the user message from history since we'll retry
-        if (conversationHistoryRef.current.length > 0 && 
+
+        if (conversationHistoryRef.current.length > 0 &&
             conversationHistoryRef.current[conversationHistoryRef.current.length - 1].role === 'user') {
           conversationHistoryRef.current.pop();
         }
-        
-        // Store message for retry
+
         retryMessageRef.current = originalUserMessage;
+        retryStreamingRef.current = streaming;
         isRetryingRef.current = true;
-        
-        // Reset state
+
         setError(null);
         isProcessingRef.current = false;
         setIsLoading(false);
         setIsStreaming(false);
         setStreamingMessage(null);
-        
-        // Switch to next config (this will trigger useEffect to retry)
+
         setCurrentConfigIndex(prev => prev + 1);
         return;
       }
-      
-      // All configs failed - show error
+
       if (debug) {
         console.error(`[Debug] LLM Fallback: All configs failed. Last error: ${err.message}`);
       }
-      setError(err.message);
+      setError({ message: err.message, code: 'LLM_ERROR' });
 
       const errorMsg = {
-        role: "assistant",
+        role: 'assistant',
         content: currentLocale.errorMessage.replace('{message}', err.message)
       };
-
       conversationHistoryRef.current.push(errorMsg);
-      
-      // Update UI messages with exclusion flags after error
+
       const { allMessages } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
-      // Filter out all system messages from UI (they should not be displayed to user)
-      uiMessages = allMessages.filter(msg => msg.role !== 'system');
-      setMessages(uiMessages);
+      setMessages(allMessages.filter(msg => msg.role !== 'system'));
     } finally {
-      // Only clean up if not retrying with fallback
-      if (!(currentConfigIndex < normalizedConfigs.length - 1 && error)) {
+      if (requestGenRef.current === myGen && !isRetryingRef.current) {
         setIsLoading(false);
         setIsStreaming(false);
         setStreamingMessage(null);
         isProcessingRef.current = false;
+        if (!userCancelledRef.current) {
+          turnStartIndexRef.current = null;
+          inFlightUserMessageRef.current = null;
+        }
       }
     }
-  }, [isLoading, callOpenAIStream, handleToolCalls, currentLocale, locale, validateAssistantContent, maxContextSize, persistChatHistory, currentConfigIndex, normalizedConfigs, error, systemPrompt]);
+  }, [isLoading, callOpenAI, callOpenAIStream, handleToolCalls, availableTools, currentLocale, locale, validateAssistantContent, maxContextSize, persistChatHistory, currentConfigIndex, normalizedConfigs, systemPrompt, maxToolLoops, debug]);
 
-  // Store sendMessageStream reference for retry logic
+  const sendMessage = useCallback((userMessage) => sendWithMode(userMessage, { streaming: false }), [sendWithMode]);
+  const sendMessageStream = useCallback((userMessage) => sendWithMode(userMessage, { streaming: true }), [sendWithMode]);
+
   useEffect(() => {
     sendMessageStreamRef.current = sendMessageStream;
   }, [sendMessageStream]);
+
+  useEffect(() => {
+    sendMessageRef.current = sendMessage;
+  }, [sendMessage]);
+
+  const stop = useCallback(() => {
+    const restored = inFlightUserMessageRef.current || '';
+    userCancelledRef.current = true;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+
+    const start = turnStartIndexRef.current;
+    if (typeof start === 'number' && start >= 0) {
+      conversationHistoryRef.current = conversationHistoryRef.current.slice(0, start);
+    }
+    turnStartIndexRef.current = null;
+    inFlightUserMessageRef.current = null;
+
+    const { allMessages } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
+    setMessages(allMessages.filter(msg => msg.role !== 'system'));
+    setStreamingMessage(null);
+    setIsStreaming(false);
+    setIsLoading(false);
+    setIsExecutingTools(false);
+    setError(null);
+    isProcessingRef.current = false;
+    isRetryingRef.current = false;
+    retryMessageRef.current = null;
+
+    return restored;
+  }, [maxContextSize]);
 
   return {
     messages,
@@ -1933,6 +1707,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
     error,
     sendMessage,
     sendMessageStream,
+    stop,
     isStreaming,
     streamingMessage,
     isExecutingTools,

@@ -66,6 +66,7 @@ npm install @chatrium/widget
 ```javascript
 // src/App.js
 import { ChatWidget, useMCPServer } from "@chatrium/widget";
+import "@chatrium/widget/styles";
 import { TOOLS } from "./mcp_tools";
 
 function App() {
@@ -102,6 +103,7 @@ npm install @chatrium/widget
 // src/App.tsx
 import React from 'react';
 import { ChatWidget, useMCPServer } from "@chatrium/widget";
+import "@chatrium/widget/styles";
 import { TOOLS } from "./mcp_tools";
 
 function App(): JSX.Element {
@@ -949,7 +951,7 @@ Context size is configured per LLM config in the `llmConfigs` array (see API Con
 - Excluded messages remain visible in the UI but are dimmed and marked with a warning icon
 - Hovering over excluded messages shows a tooltip explaining they won't be sent to the AI assistant
 - Token counting: Uses accurate tiktoken (cl100k_base) if installed, otherwise falls back to approximate counting (~3.5 chars per token)
-- **Note**: For accurate token counting, install `js-tiktoken` as an optional dependency: `npm install js-tiktoken` (~21MB). Without it, the widget uses approximate counting and is ~20MB smaller.
+- **Note**: For accurate token counting, install `js-tiktoken` as an optional dependency: `npm install js-tiktoken`. Without it, the widget uses approximate counting. The tokenizer is loaded dynamically and is not bundled into the widget.
 
 #### Tool Execution Control
 

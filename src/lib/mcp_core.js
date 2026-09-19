@@ -6,7 +6,32 @@ const MCP_EVENT_NAME = 'mcp_message_internal';
  * @returns {string} Unique ID.
  */
 function generateId() {
-  return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 11);
+}
+
+function bytesToBase64(data) {
+  const arr = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < arr.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, arr.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function isMethodNotFoundError(error) {
+  const code = error?.code ?? error?.data?.code;
+  if (code === -32601 || code === -32600) return true;
+  const message = String(error?.message || '');
+  return /method ['`]?[\w./]+['`]? not found|-32601|-32600/i.test(message);
+}
+
+function attachRpcErrorFields(err, error) {
+  if (error && typeof error === 'object') {
+    if (error.code !== undefined) err.code = error.code;
+    if (error.data !== undefined) err.data = error.data;
+  }
+  return err;
 }
 
 class MCPBase {
@@ -16,14 +41,28 @@ class MCPBase {
     this.debug = debug;
     this.pendingRequests = new Map();
     this.requestHandlers = new Map();
+    this.defaultTimeoutMs = 30000;
+    this._onEvent = (event) => {
+      if (event.detail && event.detail.senderType === this.type) return;
+      this.handleMessage(event.detail);
+    };
     this.setupListeners();
   }
 
   setupListeners() {
-    this.eventTarget.addEventListener(MCP_EVENT_NAME, (event) => {
-      if (event.detail && event.detail.senderType === this.type) return;
-      this.handleMessage(event.detail);
-    });
+    this.eventTarget.addEventListener(MCP_EVENT_NAME, this._onEvent);
+  }
+
+  destroy() {
+    try {
+      this.eventTarget.removeEventListener(MCP_EVENT_NAME, this._onEvent);
+    } catch (_) { /* no-op */ }
+    for (const pending of this.pendingRequests.values()) {
+      if (pending && typeof pending.reject === 'function') {
+        pending.reject(new Error('MCP client destroyed'));
+      }
+    }
+    this.pendingRequests.clear();
   }
 
   handleMessage(message) {
@@ -49,10 +88,25 @@ class MCPBase {
     this.eventTarget.dispatchEvent(event);
   }
 
-  sendRequest(method, params) {
+  sendRequest(method, params, timeoutMs = this.defaultTimeoutMs) {
     return new Promise((resolve, reject) => {
       const id = generateId();
-      this.pendingRequests.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (this.pendingRequests.has(id)) {
+          this.pendingRequests.delete(id);
+          reject(new Error('MCP request timeout'));
+        }
+      }, timeoutMs);
+      this.pendingRequests.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      });
 
       this.send({
         jsonrpc: "2.0",
@@ -132,8 +186,7 @@ class MCPBase {
     if (pending) {
       this.pendingRequests.delete(id);
       if (error) {
-        const err = new Error(`[${error.code}] ${error.message}`);
-        err.data = error.data;
+        const err = attachRpcErrorFields(new Error(`[${error.code}] ${error.message}`), error);
         pending.reject(err);
       } else {
         pending.resolve(result);
@@ -280,7 +333,7 @@ class MCPServer extends MCPBase {
           content.text = data;
         } else if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
           // Binary data: encode as base64
-          content.blob = btoa(String.fromCharCode(...new Uint8Array(data)));
+          content.blob = bytesToBase64(data);
         } else {
           // Object/JSON: stringify
           content.text = JSON.stringify(data, null, 2);
@@ -372,6 +425,14 @@ class MCPServer extends MCPBase {
   registerResources(resources) {
     resources.forEach(resource => this.registerResource(resource));
   }
+
+  clearTools() {
+    this.tools = [];
+  }
+
+  clearResources() {
+    this.resources = [];
+  }
 }
 
 class MCPClient extends MCPBase {
@@ -389,10 +450,10 @@ class MCPClient extends MCPBase {
     let lastError;
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
-        // Add timeout to prevent infinite hang
-        const timeoutPromise = new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Initialize timeout')), 5000)
-        );
+        let timeoutId;
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error('Initialize timeout')), 5000);
+        });
         
         const initPromise = this.sendRequest('mcp.initialize', {
           version: MCP_PROTOCOL_VERSION,
@@ -402,14 +463,18 @@ class MCPClient extends MCPBase {
           }
         });
 
-        const response = await Promise.race([initPromise, timeoutPromise]);
+        try {
+          const response = await Promise.race([initPromise, timeoutPromise]);
 
-        if (response.version !== MCP_PROTOCOL_VERSION) {
-          throw new Error(`Protocol version mismatch. Server: ${response.version}, Client: ${MCP_PROTOCOL_VERSION}`);
+          if (response.version !== MCP_PROTOCOL_VERSION) {
+            throw new Error(`Protocol version mismatch. Server: ${response.version}, Client: ${MCP_PROTOCOL_VERSION}`);
+          }
+
+          this.initialized = true;
+          return response;
+        } finally {
+          clearTimeout(timeoutId);
         }
-
-        this.initialized = true;
-        return response;
       } catch (error) {
         lastError = error;
         if (attempt < retries - 1) {
@@ -503,10 +568,28 @@ class MCPExternalBaseClient {
       title: 'AI MCP Web App',
       version: '0.0.0'
     };
+    this._methodCache = Object.create(null);
   }
 
   nextId() {
     return this.requestIdCounter++;
+  }
+
+  async sendWithMethodFallback(cacheKey, specMethod, legacyMethod, params) {
+    const cached = this._methodCache[cacheKey];
+    if (cached) {
+      return this.sendRequest(this.buildRequest(cached, params));
+    }
+    try {
+      const res = await this.sendRequest(this.buildRequest(specMethod, params));
+      this._methodCache[cacheKey] = specMethod;
+      return res;
+    } catch (e) {
+      if (!isMethodNotFoundError(e)) throw e;
+      const res = await this.sendRequest(this.buildRequest(legacyMethod, params));
+      this._methodCache[cacheKey] = legacyMethod;
+      return res;
+    }
   }
 
   buildRequest(method, params) {
@@ -552,12 +635,16 @@ class MCPExternalBaseClient {
 
   async initialize() {
     if (this.initialized) return;
-    // Try spec method first, fallback to legacy
     let res;
     try {
-      res = await this.sendRequest(this.buildRequest('initialize', this.buildInitializeParams()));
+      res = await this.sendWithMethodFallback(
+        'initialize',
+        'initialize',
+        'mcp.initialize',
+        this.buildInitializeParams()
+      );
     } catch (e) {
-      // fallback to legacy
+      if (!isMethodNotFoundError(e)) throw e;
       res = await this.sendRequest(this.buildRequest('mcp.initialize', { version: MCP_PROTOCOL_VERSION, capabilities: ["tools"] }));
     }
     if (res && typeof res === 'object' && typeof res.protocolVersion === 'string') {
@@ -577,15 +664,7 @@ class MCPExternalBaseClient {
 
   async loadTools() {
     if (!this.initialized) await this.initialize();
-    // Try spec list first
-    let result;
-    try {
-      result = await this.sendRequest(this.buildRequest('tools/list'));
-    } catch (e) {
-      // fallback legacy
-      result = await this.sendRequest(this.buildRequest('mcp.tools.list'));
-    }
-    // Normalize result: spec -> { tools: [...] }, legacy -> [...]
+    const result = await this.sendWithMethodFallback('tools/list', 'tools/list', 'mcp.tools.list');
     const tools = Array.isArray(result) ? result : (result && Array.isArray(result.tools) ? result.tools : []);
     this.tools = tools;
     return this.tools;
@@ -593,15 +672,7 @@ class MCPExternalBaseClient {
 
   async loadResources() {
     if (!this.initialized) await this.initialize();
-    // Try spec list first
-    let result;
-    try {
-      result = await this.sendRequest(this.buildRequest('resources/list'));
-    } catch (e) {
-      // fallback legacy
-      result = await this.sendRequest(this.buildRequest('mcp.resources.list'));
-    }
-    // Normalize result: spec -> { resources: [...] }, legacy -> [...]
+    const result = await this.sendWithMethodFallback('resources/list', 'resources/list', 'mcp.resources.list');
     const resources = Array.isArray(result) ? result : (result && Array.isArray(result.resources) ? result.resources : []);
     this.resources = resources;
     return this.resources;
@@ -609,24 +680,12 @@ class MCPExternalBaseClient {
 
   async readResource(uri) {
     if (!this.initialized) await this.initialize();
-    // Try spec read first, fallback to legacy
-    try {
-      const res = await this.sendRequest(this.buildRequest('resources/read', { uri }));
-      return res;
-    } catch (e) {
-      return this.sendRequest(this.buildRequest('mcp.resources.read', { uri }));
-    }
+    return this.sendWithMethodFallback('resources/read', 'resources/read', 'mcp.resources.read', { uri });
   }
 
   async callTool(name, args) {
     if (!this.initialized) await this.initialize();
-    // Try spec call first, fallback to legacy
-    try {
-      const res = await this.sendRequest(this.buildRequest('tools/call', { name, arguments: args }));
-      return res;
-    } catch (e) {
-      return this.sendRequest(this.buildRequest('mcp.tools.call', { name, arguments: args }));
-    }
+    return this.sendWithMethodFallback('tools/call', 'tools/call', 'mcp.tools.call', { name, arguments: args });
   }
 }
 
@@ -706,9 +765,7 @@ class MCPWebSocketClient extends MCPExternalBaseClient {
             if (pending) {
               this.pendingRequests.delete(data.id);
               if (data.error) {
-                const err = new Error(`[${data.error.code}] ${data.error.message}`);
-                err.data = data.error.data;
-                pending.reject(err);
+                pending.reject(attachRpcErrorFields(new Error(`[${data.error.code}] ${data.error.message}`), data.error));
               } else {
                 pending.resolve(data.result);
               }
@@ -739,11 +796,29 @@ class MCPWebSocketClient extends MCPExternalBaseClient {
 
   sendRequest(payload) {
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(payload.id, { resolve, reject });
+      const timeoutMs = this.options.timeoutMs || 30000;
+      const timer = setTimeout(() => {
+        if (this.pendingRequests.has(payload.id)) {
+          this.pendingRequests.delete(payload.id);
+          reject(new Error('WebSocket request timeout'));
+        }
+      }, timeoutMs);
+      this.pendingRequests.set(payload.id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      });
       const sendNow = () => {
         try {
           this.ws.send(JSON.stringify(payload));
         } catch (e) {
+          this.pendingRequests.delete(payload.id);
+          clearTimeout(timer);
           reject(e);
         }
       };
@@ -862,9 +937,7 @@ class MCPSseClient extends MCPExternalBaseClient {
             if (pending) {
               this.pendingRequests.delete(data.id);
               if (data.error) {
-                const err = new Error(`[${data.error.code}] ${data.error.message}`);
-                err.data = data.error.data;
-                pending.reject(err);
+                pending.reject(attachRpcErrorFields(new Error(`[${data.error.code}] ${data.error.message}`), data.error));
               } else {
                 pending.resolve(data.result);
               }
@@ -934,15 +1007,12 @@ class MCPSseClient extends MCPExternalBaseClient {
             const pending = this.pendingRequests.get(payload.id);
             if (pending) this.pendingRequests.delete(payload.id);
             if (json.error) {
-              const err = new Error(`[${json.error.code}] ${json.error.message}`);
-              err.data = json.error.data;
-              return Promise.reject(err);
+              return Promise.reject(attachRpcErrorFields(new Error(`[${json.error.code}] ${json.error.message}`), json.error));
             }
             return json.result;
           }
         }
         if (contentType.includes('text/event-stream') && res.body) {
-          // Parse SSE from the POST response body and resolve when matching id arrives
           const reader = res.body.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
@@ -964,21 +1034,17 @@ class MCPSseClient extends MCPExternalBaseClient {
                       const pending = this.pendingRequests.get(payload.id);
                       if (pending) this.pendingRequests.delete(payload.id);
                       if (msg.error) {
-                        const err = new Error(`[${msg.error.code}] ${msg.error.message}`);
-                        err.data = msg.error.data;
-                        throw err;
+                        return { error: attachRpcErrorFields(new Error(`[${msg.error.code}] ${msg.error.message}`), msg.error) };
                       }
-                      throw { __resolve: msg.result };
+                      return { result: msg.result };
                     }
-                  } catch (e) {
-                    if (e && e.__resolve !== undefined) {
-                      throw e; // bubble to outer to resolve
-                    }
+                  } catch (_) {
                     // ignore non-matching or malformed events
                   }
                 }
               }
             }
+            return null;
           };
           try {
             // eslint-disable-next-line no-constant-condition
@@ -986,29 +1052,38 @@ class MCPSseClient extends MCPExternalBaseClient {
               const { value, done } = await reader.read();
               if (done) break;
               buffer += decoder.decode(value, { stream: true });
-              processLines();
+              const outcome = processLines();
+              if (outcome) {
+                if (outcome.error) throw outcome.error;
+                return outcome.result;
+              }
             }
-          } catch (e) {
-            if (e && e.__resolve !== undefined) {
-              return e.__resolve;
-            }
-            throw e;
+          } finally {
+            try { await reader.cancel(); } catch (_) { /* no-op */ }
+            try { reader.releaseLock(); } catch (_) { /* no-op */ }
           }
-          // If stream ended without matching response, timeout fallback
         }
       }
       // Otherwise, await SSE resolution
       return new Promise((resolve, reject) => {
-        this.pendingRequests.set(payload.id, { resolve, reject });
-        // Optional timeout to avoid hanging forever
         const timeoutMs = this.options.timeoutMs || 30000;
-        setTimeout(() => {
+        const timer = setTimeout(() => {
           const pending = this.pendingRequests.get(payload.id);
           if (pending) {
             this.pendingRequests.delete(payload.id);
             reject(new Error('SSE request timeout'));
           }
         }, timeoutMs);
+        this.pendingRequests.set(payload.id, {
+          resolve: (value) => {
+            clearTimeout(timer);
+            resolve(value);
+          },
+          reject: (error) => {
+            clearTimeout(timer);
+            reject(error);
+          }
+        });
       });
     } catch (e) {
       this.pendingRequests.delete(payload.id);

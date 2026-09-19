@@ -5,6 +5,7 @@ export default {
   clearChat: "Clear chat",
   collapseChat: "Collapse chat",
   send: "Send",
+  cancelRequest: "Cancel request",
   thinking: "is thinking...",
   error: "Error",
   greetingTitle: "🤖 AI Assistant:",

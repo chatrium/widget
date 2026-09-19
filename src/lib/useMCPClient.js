@@ -88,16 +88,12 @@ export const useMCPClient = (options = {}) => {
     if (initializingRef.current) {
       return;
     }
-    
-    // Only initialize if client doesn't exist
-    if (client) {
-      return;
-    }
-    
+
     initializingRef.current = true;
     
     // Flag to cancel initialization if component unmounts or dependencies change
     let cancelled = false;
+    let internalClient = null;
     
     const initClient = async () => {
       try {
@@ -106,10 +102,14 @@ export const useMCPClient = (options = {}) => {
         }
         
         setStatus('connecting');
-        const internalClient = MCP.createClient(window, debug);
+        internalClient = MCP.createClient(window, debug);
 
         // Initialize protocol
         await internalClient.initialize();
+        if (cancelled) {
+          if (typeof internalClient.destroy === 'function') internalClient.destroy();
+          return;
+        }
         
         if (debug) {
           console.log('[Debug] MCP Client: Protocol initialized');
@@ -205,9 +205,14 @@ export const useMCPClient = (options = {}) => {
             if (typeof name === 'string' && name.includes('_')) {
               const [sid, ...rest] = name.split('_');
               const tool = rest.join('_');
+              if (sid === 'internal' && tool) {
+                return internalClient.callTool(tool, args);
+              }
               const ext = externalClients.current.get(sid);
-              if (!ext) throw new Error(`Unknown external server '${sid}'`);
-              return ext.callTool(tool, args);
+              if (ext) {
+                return ext.callTool(tool, args);
+              }
+              // Name contains '_' but prefix is not a known server id (e.g. snake_case tools)
             }
             
             const internalHas = internalTools.some(t => t.name === name);
@@ -235,9 +240,14 @@ export const useMCPClient = (options = {}) => {
               const parts = uri.split('_');
               const sid = parts[0];
               const resourceUri = parts.slice(1).join('_');
+              if (sid === 'internal' && resourceUri) {
+                return internalClient.readResource(resourceUri);
+              }
               const ext = externalClients.current.get(sid);
-              if (!ext) throw new Error(`Unknown external server '${sid}'`);
-              return ext.readResource(resourceUri);
+              if (ext) {
+                return ext.readResource(resourceUri);
+              }
+              // URI contains '_' but prefix is not a known server id
             }
             const internalHas = internalResources.some(r => r.uri === uri);
             const externalResults = Array.from(externalResultsMap.values());
@@ -377,17 +387,23 @@ export const useMCPClient = (options = {}) => {
     });
 
     return () => {
-      // Cancel ongoing initialization
       cancelled = true;
       initializingRef.current = false;
-      
-      // Cleanup: disconnect all external clients to stop reconnection attempts
-      for (const [id, ec] of externalClients.current.entries()) {
+
+      if (internalClient && typeof internalClient.destroy === 'function') {
+        internalClient.destroy();
+      }
+
+      for (const ec of externalClients.current.values()) {
         if (ec && typeof ec.disconnect === 'function') {
           ec.disconnect();
         }
       }
       externalClients.current.clear();
+      setClient(null);
+      setTools([]);
+      setResources([]);
+      setStatus('disconnected');
     };
   }, [mcpServersJson, envVarsJson, allowedToolsJson, blockedToolsJson, externalServersJson]);
 

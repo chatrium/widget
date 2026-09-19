@@ -1,4 +1,4 @@
-import {useEffect, useRef, useState, useMemo} from 'react';
+import {useEffect, useRef, useState, useMemo, cloneElement, memo} from 'react';
 import { useMCPClient } from '../useMCPClient';
 import {useOpenAIChat} from '../useOpenAIChat';
 import { createVoiceRecognition } from '../voiceInput';
@@ -59,6 +59,8 @@ const defaultTheme = {
   sendButtonColor: 'white',
   sendButtonHoverBackground: 'linear-gradient(145deg, #4a9fe3, #2b6cb0)',
   sendButtonDisabledBackground: 'linear-gradient(145deg, #c5cacf, #a8acb3)',
+  cancelButtonBackground: 'linear-gradient(145deg, #ff6b6b, #e55555)',
+  cancelButtonHoverBackground: 'linear-gradient(145deg, #e55555, #c53030)',
   
   // Tooltip
   tooltipBackground: 'linear-gradient(135deg, #ffffff, #f8f9fa)',
@@ -511,6 +513,103 @@ const isDisplayContentEmpty = (content) => {
   return !meaningful || meaningful === '';
 };
 
+const htmlToPlainText = (html) => {
+  if (!html) return '';
+  return String(html)
+    .replace(/<[^>]*>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/[\s\u00A0\u200B\u200C\u200D\uFEFF]/g, '');
+};
+
+const ChatMessage = memo(function ChatMessage({
+  msg,
+  styles,
+  currentLocale,
+  assistantName,
+  mergedTheme
+}) {
+  const displayContent = useMemo(() => {
+    if (msg.role === 'assistant') {
+      if (msg.tool_calls && msg.tool_calls.length > 0) return '';
+      if (msg.content) return cleanAssistantContent(msg.content);
+      return msg.content;
+    }
+    if (msg.content) return cleanAssistantContent(msg.content);
+    return msg.content;
+  }, [msg.role, msg.content, msg.tool_calls]);
+
+  const html = useMemo(() => {
+    if (!displayContent || !String(displayContent).trim()) return '';
+    return renderMarkdown(displayContent, styles);
+  }, [displayContent, styles]);
+
+  if (msg.role === 'tool') return null;
+  if (msg.tool_calls && msg.tool_calls.length > 0) return null;
+  if (msg.role === 'assistant') {
+    if (!displayContent || isDisplayContentEmpty(displayContent)) return null;
+    if (!htmlToPlainText(html)) return null;
+  } else if (!msg.content) {
+    return null;
+  }
+
+  const isExcluded = msg.excludedFromContext === true;
+  const tooltipText = isExcluded ? currentLocale.messageExcludedFromContext : '';
+  const messageStyle = msg.role === 'user'
+    ? {
+        background: mergedTheme.userMessageBackground,
+        color: mergedTheme.userMessageColor
+      }
+    : msg.role === 'assistant'
+    ? {
+        background: mergedTheme.assistantMessageBackground,
+        border: `1px solid ${mergedTheme.assistantMessageBorder}`,
+        color: mergedTheme.assistantMessageColor
+      }
+    : {};
+  const avatarUrl = msg.role === 'user'
+    ? mergedTheme.userAvatar
+    : msg.role === 'assistant'
+      ? mergedTheme.botAvatar
+      : null;
+  const messageClasses = `${styles['message']} ${styles[`message-${msg.role}`]} ${isExcluded ? styles['message-excluded'] : ''}`;
+
+  return (
+    <div className={messageClasses} style={messageStyle} title={tooltipText}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
+        {avatarUrl && (
+          <img
+            src={avatarUrl}
+            alt={msg.role}
+            style={{
+              width: '28px',
+              height: '28px',
+              borderRadius: '50%',
+              objectFit: 'cover',
+              flexShrink: 0,
+              marginTop: '2px'
+            }}
+          />
+        )}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <strong>
+            {msg.role === 'user' ? currentLocale.user :
+              msg.role === 'assistant' ? (assistantName || 'AI') :
+                msg.role === 'tool' ? currentLocale.tool : msg.role}
+          </strong>:
+          {html ? (
+            <div className={styles['markdown-body']} dangerouslySetInnerHTML={{ __html: html }} />
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+});
+
 /**
  * Parse size value to CSS string
  * Accepts: number (as pixels), "100px", "50%"
@@ -605,10 +704,10 @@ const ChatWidget = ({
     ...theme
   }), [theme]);
 
-  const mergedLocales = {
+  const mergedLocales = useMemo(() => ({
     ...defaultLocales,
     ...customLocales
-  };
+  }), [customLocales]);
 
   const currentLocale = mergedLocales[locale] || mergedLocales.en;
 
@@ -642,16 +741,18 @@ const ChatWidget = ({
     debug
   });
 
-  const actualToolsSchema = toolsSchema.length > 0
-  ? toolsSchema
-  : tools.map(tool => ({
-      type: "function",
-      function: {
-        name: tool.qualifiedName || tool.name,
-        description: tool.description,
-        parameters: tool.parameters
-      }
-    }));
+  const actualToolsSchema = useMemo(() => (
+    toolsSchema.length > 0
+      ? toolsSchema
+      : tools.map(tool => ({
+          type: "function",
+          function: {
+            name: tool.qualifiedName || tool.name,
+            description: tool.description,
+            parameters: tool.parameters
+          }
+        }))
+  ), [toolsSchema, tools]);
 
   const {
     messages,
@@ -659,6 +760,7 @@ const ChatWidget = ({
     error,
     sendMessage,
     sendMessageStream,
+    stop,
     isStreaming,
     streamingMessage,
     isExecutingTools,
@@ -676,6 +778,11 @@ const ChatWidget = ({
     debug,
     { onToolError, staticResourcePatterns }
   );
+
+  const streamingHtml = useMemo(() => {
+    if (!streamingMessage?.content?.trim()) return '';
+    return renderMarkdown(streamingMessage.content, styles);
+  }, [streamingMessage?.content]);
 
 
   useEffect(() => {
@@ -745,10 +852,27 @@ const ChatWidget = ({
   };
 
   const handleSend = () => {
+    if (isLoading || isRecording) {
+      return;
+    }
     if (inputValue.trim()) {
       sendMessageStream(inputValue);
       setInputValue('');
     }
+  };
+
+  const handleCancel = () => {
+    const restored = stop();
+    setInputValue(typeof restored === 'string' ? restored : '');
+    setTimeout(() => {
+      if (inputRef.current) {
+        inputRef.current.focus();
+        const len = inputRef.current.value.length;
+        try {
+          inputRef.current.setSelectionRange(len, len);
+        } catch (_) { /* ignore */ }
+      }
+    }, 0);
   };
 
   const handleKeyPress = (e) => {
@@ -1064,6 +1188,8 @@ const ChatWidget = ({
       sendMessage,
       clearChat,
       handleSend,
+      handleCancel,
+      stop,
       handleKeyPress,
       llmConfigs,
       toolsSchema,
@@ -1088,7 +1214,7 @@ const ChatWidget = ({
       debug
     };
 
-    return React.cloneElement(customComponent, customProps);
+    return cloneElement(customComponent, customProps);
   }
 
   // Ensure CSS Modules processes all classes used in markdown
@@ -1279,104 +1405,16 @@ const ChatWidget = ({
                 </div>
               )}
 
-              {messages.map((msg, index) => {
-                // Clean content first for assistant messages
-                let displayContent = msg.content;
-                if (msg.role === 'assistant') {
-                  // During tool calls, suppress assistant content; status bubble shows action
-                  if (msg.tool_calls && msg.tool_calls.length > 0) {
-                    displayContent = '';
-                  } else if (msg.content) {
-                    displayContent = cleanAssistantContent(msg.content);
-                  }
-                } else if (msg.content) {
-                  displayContent = cleanAssistantContent(msg.content);
-                }
-
-                const shouldDisplayMessage = () => {
-                  // Hide tool role messages entirely
-                  if (msg.role === 'tool') return false;
-
-                  // Suppress listing of tool calls as separate message; status bubble will reflect state
-                  if (msg.tool_calls && msg.tool_calls.length > 0) return false;
-
-                  if (msg.role === 'assistant') {
-                    // Check if cleaned content is empty
-                    if (!displayContent || isDisplayContentEmpty(displayContent)) {
-                      return false;
-                    }
-                    // Double-check by rendering markdown and checking if result has text
-                    const rendered = renderMarkdown(displayContent, styles);
-                    const tempDiv = document.createElement('div');
-                    tempDiv.innerHTML = rendered;
-                    const textContent = tempDiv.textContent || tempDiv.innerText || '';
-                    return textContent.trim().length > 0;
-                  }
-
-                  return !!msg.content;
-                };
-
-                if (!shouldDisplayMessage()) {
-                  return null;
-                }
-
-                const isExcluded = msg.excludedFromContext === true;
-                const tooltipText = isExcluded ? currentLocale.messageExcludedFromContext : '';
-
-                const messageStyle = msg.role === 'user' 
-                  ? {
-                      background: mergedTheme.userMessageBackground,
-                      color: mergedTheme.userMessageColor
-                    }
-                  : msg.role === 'assistant'
-                  ? {
-                      background: mergedTheme.assistantMessageBackground,
-                      border: `1px solid ${mergedTheme.assistantMessageBorder}`,
-                      color: mergedTheme.assistantMessageColor
-                    }
-                  : {};
-
-                const avatarUrl = msg.role === 'user' 
-                  ? mergedTheme.userAvatar 
-                  : msg.role === 'assistant' 
-                    ? mergedTheme.botAvatar 
-                    : null;
-
-                const messageClasses = `${styles['message']} ${styles[`message-${msg.role}`]} ${isExcluded ? styles['message-excluded'] : ''}`;
-
-                return (
-                  <div key={index} className={messageClasses} style={messageStyle} title={tooltipText}>
-                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
-                      {avatarUrl && (
-                        <img 
-                          src={avatarUrl} 
-                          alt={msg.role} 
-                          style={{ 
-                            width: '28px', 
-                            height: '28px', 
-                            borderRadius: '50%', 
-                            objectFit: 'cover',
-                            flexShrink: 0,
-                            marginTop: '2px'
-                          }}
-                        />
-                      )}
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <strong>
-                          {msg.role === 'user' ? currentLocale.user :
-                            msg.role === 'assistant' ? (assistantName || 'AI') :
-                              msg.role === 'tool' ? currentLocale.tool : msg.role}
-                        </strong>:
-                        {displayContent && displayContent.trim() ? (
-                          <div className={styles['markdown-body']} dangerouslySetInnerHTML={{
-                            __html: renderMarkdown(displayContent, styles)
-                          }} />
-                        ) : null}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
+              {messages.map((msg, index) => (
+                <ChatMessage
+                  key={`${index}-${msg.role}-${msg.tool_call_id || ''}`}
+                  msg={msg}
+                  styles={styles}
+                  currentLocale={currentLocale}
+                  assistantName={assistantName}
+                  mergedTheme={mergedTheme}
+                />
+              ))}
               {streamingMessage && streamingMessage.content && streamingMessage.content.trim() && (
                 <div 
                   className={`${styles['message']} ${styles['message-assistant']}`}
@@ -1404,7 +1442,7 @@ const ChatWidget = ({
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <strong>{assistantName || 'AI'}:</strong>
                       <div className={styles['markdown-body']} dangerouslySetInnerHTML={{
-                        __html: renderMarkdown(streamingMessage.content, styles)
+                        __html: streamingHtml
                       }} />
                     </div>
                   </div>
@@ -1460,7 +1498,7 @@ const ChatWidget = ({
                 ref={inputRef}
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
-                onKeyPress={handleKeyPress}
+                onKeyDown={handleKeyPress}
                 placeholder={isRecording ? currentLocale.speaking : currentLocale.enterMessage}
                 disabled={isLoading || isRecording}
                 rows="2"
@@ -1475,18 +1513,43 @@ const ChatWidget = ({
                   e.target.style.borderColor = mergedTheme.inputBorder;
                 }}
               />
-              <button 
-                onClick={handleSend} 
-                disabled={isLoading || !inputValue.trim() || isRecording}
-                style={{
-                  background: (isLoading || !inputValue.trim() || isRecording) 
-                    ? mergedTheme.sendButtonDisabledBackground 
-                    : mergedTheme.sendButtonBackground,
-                  color: mergedTheme.sendButtonColor
-                }}
-              >
-                {isLoading ? '...' : '➤'}
-              </button>
+              {isLoading ? (
+                <button
+                  type="button"
+                  className={styles['cancel-request']}
+                  onClick={handleCancel}
+                  title={currentLocale.cancelRequest}
+                  aria-label={currentLocale.cancelRequest}
+                  style={{
+                    background: mergedTheme.cancelButtonBackground,
+                    color: mergedTheme.sendButtonColor
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = mergedTheme.cancelButtonHoverBackground;
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = mergedTheme.cancelButtonBackground;
+                  }}
+                >
+                  ×
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleSend}
+                  disabled={!inputValue.trim() || isRecording}
+                  title={currentLocale.send}
+                  aria-label={currentLocale.send}
+                  style={{
+                    background: (!inputValue.trim() || isRecording)
+                      ? mergedTheme.sendButtonDisabledBackground
+                      : mergedTheme.sendButtonBackground,
+                    color: mergedTheme.sendButtonColor
+                  }}
+                >
+                  ➤
+                </button>
+              )}
             </div>
 
             {/* Version info in bottom-right corner */}

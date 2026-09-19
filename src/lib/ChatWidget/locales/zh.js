@@ -5,6 +5,7 @@ export default {
   clearChat: "清空聊天",
   collapseChat: "收起聊天",
   send: "发送",
+  cancelRequest: "取消请求",
   thinking: "正在思考...",
   error: "错误",
   greetingTitle: "🤖 AI助手:",

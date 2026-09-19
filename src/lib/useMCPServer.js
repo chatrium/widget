@@ -1,7 +1,5 @@
-import { useEffect } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { MCP } from './mcp_core';
-
-let serverInstance = null;
 
 /**
  * Hook for initializing MCP server
@@ -10,39 +8,52 @@ let serverInstance = null;
  * @param {boolean} debug Enable debug logging
  */
 export const useMCPServer = (tools = [], resources = [], debug = false) => {
+  const [server, setServer] = useState(null);
+  const serverRef = useRef(null);
+
   useEffect(() => {
-    if (!serverInstance) {
-      serverInstance = MCP.createServer(window, debug);
-
-      // Register tools
-      tools.forEach(tool => {
-        serverInstance.registerTool({
-          name: tool.function.name,
-          description: tool.function.description,
-          parameters: tool.function.parameters,
-          handler: tool.handler
-        });
-      });
-
-      // Register resources (Spec 2025-06-18)
-      resources.forEach(resource => {
-        serverInstance.registerResource({
-          uri: resource.uri,
-          name: resource.name,
-          title: resource.title,           // Spec 2025-06-18
-          description: resource.description,
-          mimeType: resource.mimeType,
-          size: resource.size,             // Spec 2025-06-18
-          annotations: resource.annotations,  // Include annotations
-          handler: resource.handler
-        });
-      });
-    }
+    const instance = MCP.createServer(window, debug);
+    serverRef.current = instance;
+    setServer(instance);
 
     return () => {
-      // Cleanup if needed
+      if (typeof instance.destroy === 'function') {
+        instance.destroy();
+      }
+      serverRef.current = null;
+      setServer(null);
     };
-  }, [tools, resources, debug]);
+  }, [debug]);
 
-  return serverInstance;
+  useEffect(() => {
+    const instance = serverRef.current;
+    if (!instance) return;
+
+    if (typeof instance.clearTools === 'function') instance.clearTools();
+    if (typeof instance.clearResources === 'function') instance.clearResources();
+
+    (tools || []).forEach(tool => {
+      instance.registerTool({
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: tool.function.parameters,
+        handler: tool.handler
+      });
+    });
+
+    (resources || []).forEach(resource => {
+      instance.registerResource({
+        uri: resource.uri,
+        name: resource.name,
+        title: resource.title,
+        description: resource.description,
+        mimeType: resource.mimeType,
+        size: resource.size,
+        annotations: resource.annotations,
+        handler: resource.handler
+      });
+    });
+  }, [tools, resources, server]);
+
+  return server;
 };

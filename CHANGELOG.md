@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.8] - 2026-09-19
+
+### Added
+- Cancel control on the send button while the assistant is answering
+  - Replaces the disabled send button with a red ×
+  - Aborts the in-flight LLM request immediately
+  - Removes the partial assistant reply and the last user bubble
+  - Restores the last user query into the input field
+
+### Fixed
+- Tool/resource names with `_` are no longer mis-routed unless the prefix is a known MCP server
+- Tool-call history stays in valid pairs (save/trim/parse) so follow-up completions do not 400
+- `maxToolLoops` off-by-one no longer drops the last allowed loop
+- MCP JSON-RPC method fallback only on `-32601`/`-32600`; SSE errors now propagate
+- MCP client/server lifecycle: per-instance server, reconnect on config change, destroy/timeout cleanup
+- Voice input: unknown locale falls back to `en-US`; handlers detach on cleanup
+
+### Changed
+- `js-tiktoken` is no longer bundled; it is an optional peer/install
+- CJS build is `dist/index.cjs`; UMD uses classic JSX (`React.createElement`)
+- CSS is extracted to `chat-widget.css` (`@chatrium/widget/styles`)
+- Markdown messages and tool schemas are memoized; conversation loop is unified
+
 ## [3.0.3] - 2025-10-27
 
 ### Improved
