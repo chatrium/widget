@@ -379,6 +379,7 @@
 
 .chat-messages {
     flex: 1;
+    overflow-x: hidden;
     overflow-y: auto;
     padding: 14px;
     background-color: #f8fafc;
@@ -455,11 +456,155 @@
 
 .chat-input-area {
     display: flex;
+    flex-direction: column;
+    position: relative;
     padding: 14px;
     background: white;
     border-top: 1px solid #edf2f7;
-    gap: 10px;
+    gap: 8px;
     box-shadow: 0 -2px 4px rgba(0,0,0,0.03);
+}
+
+.chat-input-area-drop {
+    outline: 2px dashed #90cdf4;
+    outline-offset: -6px;
+    background: #ebf8ff;
+}
+
+.chat-composer-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 10px;
+    width: 100%;
+}
+
+.attach-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+.attach-previews {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 0 2px;
+}
+
+.attach-preview {
+    position: relative;
+    width: 56px;
+    height: 56px;
+    border-radius: 8px;
+    overflow: hidden;
+    flex-shrink: 0;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+.attach-preview img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.attach-remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
+    border: none;
+    border-radius: 50%;
+    background: rgba(15, 23, 42, 0.72);
+    color: white;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+}
+
+.attach-error {
+    font-size: 12px;
+    color: #c53030;
+    padding: 0 4px;
+}
+
+.image-thumbs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.image-thumb-btn {
+    width: 56px;
+    height: 56px;
+    padding: 0;
+    border: none;
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+    background: transparent;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+.image-thumb,
+.md-image-thumb {
+    width: 56px;
+    height: 56px;
+    object-fit: cover;
+    border-radius: 8px;
+    display: block;
+}
+
+.md-image-link {
+    display: inline-block;
+    line-height: 0;
+    vertical-align: middle;
+}
+
+.image-lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 10050;
+    background: rgba(15, 23, 42, 0.72);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+}
+
+.image-lightbox img {
+    max-width: min(92vw, 900px);
+    max-height: 88vh;
+    object-fit: contain;
+    border-radius: 8px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+}
+
+.image-lightbox-close {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    width: 36px;
+    height: 36px;
+    border: none;
+    border-radius: 50%;
+    background: rgba(15, 23, 42, 0.8);
+    color: white;
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
 }
 
 .chat-input-area textarea {
@@ -487,7 +632,7 @@
     background: white;
 }
 
-.chat-input-area button {
+.chat-input-area .composer-action {
     width: 44px;
     height: 44px;
     border-radius: 50%;
@@ -500,13 +645,14 @@
     align-items: center;
     justify-content: center;
     transition: all 0.2s;
+    flex-shrink: 0;
     box-shadow:
         0 4px 8px rgba(107, 180, 227, 0.3),
         0 2px 4px rgba(0,0,0,0.1),
         inset 0 1px 0 rgba(255,255,255,0.3);
 }
 
-.chat-input-area button:hover:not(:disabled) {
+.chat-input-area .composer-action:hover:not(:disabled) {
     transform: scale(1.05);
     background: linear-gradient(145deg, #4a9fe3, #2b6cb0);
     box-shadow:
@@ -515,7 +661,7 @@
         inset 0 1px 0 rgba(255,255,255,0.4);
 }
 
-.chat-input-area button:disabled {
+.chat-input-area .composer-action:disabled {
     opacity: 0.6;
     cursor: not-allowed;
     transform: none;
@@ -525,7 +671,20 @@
         inset 0 1px 0 rgba(255,255,255,0.2);
 }
 
-.chat-input-area button.cancel-request {
+.chat-input-area .composer-action.attach-button {
+    background: linear-gradient(145deg, #edf2f7, #e2e8f0);
+    color: #4a5568;
+    box-shadow:
+        0 2px 4px rgba(0,0,0,0.08),
+        inset 0 1px 0 rgba(255,255,255,0.6);
+}
+
+.chat-input-area .composer-action.attach-button:hover:not(:disabled) {
+    background: linear-gradient(145deg, #e2e8f0, #cbd5e0);
+    color: #2d3748;
+}
+
+.chat-input-area .composer-action.cancel-request {
     font-size: 22px;
     line-height: 1;
     font-weight: 600;
@@ -535,7 +694,7 @@
         inset 0 1px 0 rgba(255,255,255,0.3);
 }
 
-.chat-input-area button.cancel-request:hover {
+.chat-input-area .composer-action.cancel-request:hover {
     transform: scale(1.05);
     box-shadow:
         0 6px 12px rgba(229, 85, 85, 0.4),
@@ -651,6 +810,7 @@
     background: #f8fafc;
     color: #475569;
     border-radius: 6px;
+    overflow: visible;
 }
 
 /* Text formatting */
@@ -685,11 +845,60 @@ del {
 
 /* Tables */
 .table-container {
-    overflow-x: auto;             /* enable horizontal scroll for wide tables */
     margin: 8px 0;
     border-radius: 8px;
     border: 1px solid #e2e8f0;
     background: #ffffff;
+    overflow: hidden;
+}
+
+.table-export-bar {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    padding: 4px 8px;
+    background: #f1f5f9;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+.table-export-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin: 0;
+    padding: 3px 8px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    background: #ffffff;
+    color: #334155;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    line-height: 1.2;
+    cursor: pointer;
+    white-space: nowrap;
+    -webkit-appearance: none;
+    appearance: none;
+}
+
+.table-export-btn:hover,
+.table-export-btn:focus-visible {
+    background: #edf2f7;
+    border-color: #90cdf4;
+    color: #2b6cb0;
+}
+
+.table-export-btn:focus-visible {
+    outline: 2px solid #4a9fe3;
+    outline-offset: 1px;
+}
+
+.table-export-btn svg {
+    flex-shrink: 0;
+}
+
+.table-scroll {
+    overflow-x: auto;             /* enable horizontal scroll for wide tables */
 }
 
 .md-table {
@@ -726,6 +935,51 @@ del {
 
 .md-table tbody tr:last-child td {
     border-bottom: none;
+}
+
+.math-inline {
+    display: inline;
+}
+
+.math-display {
+    display: block;
+    overflow-x: auto;
+    overflow-y: hidden;
+    max-width: 100%;
+    margin: 8px 0;
+}
+
+.md-table tbody td .math-inline,
+.md-table tbody td .math-display,
+.md-table thead th .math-inline,
+.md-table thead th .math-display {
+    white-space: normal;
+}
+
+.md-table tbody td:has(.math-inline),
+.md-table tbody td:has(.math-display),
+.md-table thead th:has(.math-inline),
+.md-table thead th:has(.math-display) {
+    white-space: normal;
+}
+
+.markdown-body blockquote .math-inline,
+.markdown-body blockquote .math-display {
+    color: inherit;
+}
+
+.markdown-body mjx-container {
+    max-width: 100%;
+}
+
+.markdown-body mjx-container[display="true"] {
+    display: block;
+    overflow-x: auto;
+    overflow-y: hidden;
+}
+
+.markdown-body mjx-assistive-mml {
+    display: none !important;
 }
 
 /* Version info in bottom-right corner */

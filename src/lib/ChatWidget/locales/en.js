@@ -23,5 +23,14 @@ export default {
   network: "Network error. Check your internet connection.",
   unknown: "An unknown error occurred.",
   voiceNotSupported: "Voice input is not supported in your browser.",
-  messageExcludedFromContext: "Message is outdated and not sent to AI assistant"
+  messageExcludedFromContext: "Message is outdated and not sent to AI assistant",
+  downloadExcel: "Download Excel",
+  attachImage: "Attach image",
+  removeImage: "Remove image",
+  imageTooLarge: "Image is too large (max {size})",
+  unsupportedImageType: "Unsupported file type. Use PNG, JPEG, GIF, or WebP.",
+  tooManyImages: "You can attach up to {count} images",
+  openImage: "Open image",
+  closeImage: "Close image",
+  imageLoadError: "Could not load image"
 };

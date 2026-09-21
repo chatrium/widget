@@ -2,8 +2,19 @@ import {useEffect, useRef, useState, useMemo, cloneElement, memo} from 'react';
 import { useMCPClient } from '../useMCPClient';
 import {useOpenAIChat} from '../useOpenAIChat';
 import { createVoiceRecognition } from '../voiceInput';
+import { typesetElement } from '../mathjax';
 import defaultLocales from './locales';
 import styles from './ChatWidget.module.css';
+import {
+  ACCEPTED_IMAGE_TYPES,
+  MAX_IMAGES_PER_MESSAGE,
+  formatMaxImageSize,
+  getMessageImages,
+  getMessageText,
+  isSafeImageUrl,
+  messageHasContent,
+  processImageFile
+} from '../chatImages';
 
 /**
  * Application version and repository URL (replaced during build from package.json)
@@ -90,9 +101,20 @@ const cleanAssistantContent = (content) => {
   // Remove tool call JSON blocks
   cleanedContent = cleanedContent.replace(/<\|constrain\|>[\s\S]*?<\|message\|>[\s\S]*?<\/message>/gi, '');
   cleanedContent = cleanedContent.replace(/<\|constrain\|>[\s\S]*?<\|message\|>[\s\S]*?$/gi, '');
+
+  const mathSlots = [];
+  cleanedContent = cleanedContent.replace(
+    /\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\$[^$\n]+\$/g,
+    (match) => {
+      mathSlots.push(match);
+      return `§§CLEANMATH${mathSlots.length - 1}§§`;
+    }
+  );
   
-  // Remove standalone JSON blocks that look like tool calls (but not inline JSON)
-  cleanedContent = cleanedContent.replace(/^\s*\{[\s\S]*?\}\s*$/gm, '');
+  // Remove standalone JSON blocks that look like tool calls (but not inline JSON or TeX braces)
+  cleanedContent = cleanedContent.replace(/^\s*\{[\s\S]*?\}\s*$/gm, (block) => (
+    /"\s*:\s*/.test(block) ? '' : block
+  ));
   
   // Remove empty markdown code blocks (multiple passes for cases with multiple blocks)
   for (let i = 0; i < 3; i++) {
@@ -130,6 +152,8 @@ const cleanAssistantContent = (content) => {
   cleanedContent = cleanedContent.replace(/^\s*[\{\}]\s*$/gm, '');
   // Remove lines that contain only "json" keyword (artifacts from markdown blocks)
   cleanedContent = cleanedContent.replace(/^\s*json\s*$/gm, '');
+
+  cleanedContent = cleanedContent.replace(/§§CLEANMATH(\d+)§§/g, (_, idx) => mathSlots[parseInt(idx, 10)] || '');
   
   // Clean up multiple consecutive newlines left after block removal (multiple passes)
   cleanedContent = cleanedContent.replace(/\n{3,}/g, '\n\n');
@@ -152,13 +176,212 @@ const escapeHtml = (unsafe) => {
     .replace(/'/g, '&#039;');
 };
 
+const unescapeHtml = (value) => String(value || '')
+  .replace(/&amp;/g, '&')
+  .replace(/&lt;/g, '<')
+  .replace(/&gt;/g, '>')
+  .replace(/&quot;/g, '"')
+  .replace(/&#039;/g, "'");
+
+const looksLikeTex = (body) => {
+  const trimmed = String(body || '').trim();
+  if (!trimmed) return false;
+  if (/^\d+([.,]\d+)?$/.test(trimmed)) return false;
+  return true;
+};
+
+const extractInlineCode = (text) => {
+  const inlineCodes = [];
+  const next = text.replace(/`([^`]+)`/g, (_, code) => {
+    const idx = inlineCodes.push(code) - 1;
+    return `§§ICODE${idx}§§`;
+  });
+  return { text: next, inlineCodes };
+};
+
+const extractMath = (text) => {
+  const mathBlocks = [];
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    if (text.startsWith('$$', i)) {
+      const end = text.indexOf('$$', i + 2);
+      if (end !== -1) {
+        const body = text.slice(i + 2, end);
+        if (looksLikeTex(body)) {
+          const idx = mathBlocks.push({ display: true, tex: body }) - 1;
+          out += `§§MATH${idx}§§`;
+          i = end + 2;
+          continue;
+        }
+      }
+    }
+    if (text.startsWith('\\[', i)) {
+      const end = text.indexOf('\\]', i + 2);
+      if (end !== -1) {
+        const body = text.slice(i + 2, end);
+        if (looksLikeTex(body)) {
+          const idx = mathBlocks.push({ display: true, tex: body }) - 1;
+          out += `§§MATH${idx}§§`;
+          i = end + 2;
+          continue;
+        }
+      }
+    }
+    if (text.startsWith('\\(', i)) {
+      const end = text.indexOf('\\)', i + 2);
+      if (end !== -1) {
+        const body = text.slice(i + 2, end);
+        if (looksLikeTex(body)) {
+          const idx = mathBlocks.push({ display: false, tex: body }) - 1;
+          out += `§§MATH${idx}§§`;
+          i = end + 2;
+          continue;
+        }
+      }
+    }
+    if (text[i] === '$' && text[i + 1] !== '$' && (i === 0 || text[i - 1] !== '\\')) {
+      const end = text.indexOf('$', i + 1);
+      if (end > i + 1 && text[end - 1] !== '\\' && !text.slice(i + 1, end).includes('\n')) {
+        const body = text.slice(i + 1, end);
+        const trimmed = body.trim();
+        const hasEdgeSpace = body.startsWith(' ') || body.endsWith(' ');
+        if (!hasEdgeSpace && looksLikeTex(trimmed)) {
+          const idx = mathBlocks.push({ display: false, tex: body }) - 1;
+          out += `§§MATH${idx}§§`;
+          i = end + 1;
+          continue;
+        }
+      }
+    }
+    out += text[i];
+    i += 1;
+  }
+  return { text: out, mathBlocks };
+};
+
+const escapeXml = (value) => String(value ?? '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;');
+
+const cellToPlainText = (cell) => {
+  if (!cell) return '';
+  const clone = cell.cloneNode(true);
+  clone.querySelectorAll('script, style').forEach((node) => node.remove());
+  clone.querySelectorAll('[data-tex]').forEach((el) => {
+    const tex = (el.getAttribute('data-tex') || '').trim();
+    if (!tex) return;
+    const isDisplay = el.getAttribute('data-math') === 'display';
+    el.replaceWith(document.createTextNode(isDisplay ? `$$${tex}$$` : `$${tex}$`));
+  });
+  clone.querySelectorAll('mjx-container').forEach((el) => {
+    const label = (el.getAttribute('aria-label') || '').trim();
+    el.replaceWith(document.createTextNode(label || (el.textContent || '').trim()));
+  });
+  clone.querySelectorAll('mjx-assistive-mml').forEach((node) => node.remove());
+  return (clone.textContent || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+};
+
+const collectTableMatrix = (table) => {
+  const rows = [];
+  const pushRow = (tr) => {
+    const cells = Array.from(tr.children).filter((el) => el.tagName === 'TH' || el.tagName === 'TD');
+    if (cells.length) rows.push(cells.map(cellToPlainText));
+  };
+  if (table.tHead && table.tHead.rows.length) {
+    Array.from(table.tHead.rows).forEach(pushRow);
+  }
+  Array.from(table.tBodies).forEach((body) => {
+    Array.from(body.rows).forEach(pushRow);
+  });
+  if (!rows.length) {
+    Array.from(table.rows).forEach(pushRow);
+  }
+  return rows;
+};
+
+const inferSpreadsheetType = (text) => {
+  if (text !== '' && !/^0\d/.test(text) && /^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) {
+    return 'Number';
+  }
+  return 'String';
+};
+
+const tableToSpreadsheetML = (table) => {
+  const matrix = collectTableMatrix(table);
+  const rowsXml = matrix.map((row) => {
+    const cellsXml = row.map((text) => {
+      const type = inferSpreadsheetType(text);
+      return `<Cell><Data ss:Type="${type}">${escapeXml(text)}</Data></Cell>`;
+    }).join('');
+    return `<Row>${cellsXml}</Row>`;
+  }).join('');
+  return (
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<?mso-application progid="Excel.Sheet"?>\n' +
+    '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"' +
+    ' xmlns:o="urn:schemas-microsoft-com:office:office"' +
+    ' xmlns:x="urn:schemas-microsoft-com:office:excel"' +
+    ' xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"' +
+    ' xmlns:html="http://www.w3.org/TR/REC-html40">' +
+    `<Worksheet ss:Name="Sheet1"><Table>${rowsXml}</Table></Worksheet>` +
+    '</Workbook>'
+  );
+};
+
+const downloadTableAsExcel = (table) => {
+  if (!table || typeof document === 'undefined') return;
+  const xml = `\uFEFF${tableToSpreadsheetML(table)}`;
+  const blob = new Blob([xml], { type: 'application/vnd.ms-excel' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'table.xls';
+  link.rel = 'noopener';
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+};
+
+const unescapeTex = (tex) => String(tex || '')
+  .replace(/&amp;/g, '&')
+  .replace(/&lt;/g, '<')
+  .replace(/&gt;/g, '>')
+  .replace(/&quot;/g, '"')
+  .replace(/&#039;/g, "'");
+
+const restoreMath = (html, mathBlocks, styles = {}) => html.replace(/§§MATH(\d+)§§/g, (_, idxStr) => {
+  const block = mathBlocks[parseInt(idxStr, 10)];
+  if (!block) return '';
+  const tex = unescapeTex(block.tex);
+  const texAttr = escapeHtml(tex);
+  if (block.display) {
+    return `<div class="${styles['math-display'] || 'math-display'}" data-math="display" data-tex="${texAttr}">\\[${tex}\\]</div>`;
+  }
+  return `<span class="${styles['math-inline'] || 'math-inline'}" data-math="inline" data-tex="${texAttr}">\\(${tex}\\)</span>`;
+});
+
 /**
  * Render a safe subset of Markdown to HTML with custom code block containers.
- * - Supports: headings, bold/italic, inline code, fenced code blocks, lists, links.
+ * - Supports: headings, bold/italic, inline code, fenced code blocks, lists, links, LaTeX.
  * - No raw HTML allowed; input is escaped first.
  */
-const renderMarkdown = (content, styles = {}) => {
+const renderMarkdown = (content, styles = {}, locale = {}) => {
   const text = escapeHtml(content || '');
+  const exportLabel = escapeHtml(locale.downloadExcel || 'Download Excel');
+  const exportBarClass = styles['table-export-bar'] || 'table-export-bar';
+  const exportBtnClass = styles['table-export-btn'] || 'table-export-btn';
+  const tableScrollClass = styles['table-scroll'] || 'table-scroll';
+  const exportIcon =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+  const exportBar =
+    `<div class="${exportBarClass}">` +
+    `<button type="button" class="${exportBtnClass}" data-export="excel" title="${exportLabel}" aria-label="${exportLabel}">${exportIcon}${exportLabel}</button>` +
+    '</div>';
 
   // Extract fenced code blocks first to avoid formatting inside them
   const codeBlocks = [];
@@ -170,6 +393,14 @@ const renderMarkdown = (content, styles = {}) => {
     // Use a placeholder that won't be affected by markdown emphasis rules
     return `§§CBLOCK${idx}§§`;
   });
+
+  const inlineExtracted = extractInlineCode(preprocessed);
+  preprocessed = inlineExtracted.text;
+  const { inlineCodes } = inlineExtracted;
+
+  const mathExtracted = extractMath(preprocessed);
+  preprocessed = mathExtracted.text;
+  const { mathBlocks } = mathExtracted;
 
   // Basic block elements
   // Headings: ###### to # at line starts
@@ -231,7 +462,12 @@ const renderMarkdown = (content, styles = {}) => {
                   .join('')}</tbody>`
               : '<tbody></tbody>';
             
-            processedLines.push(`<div class="${styles['table-container'] || 'table-container'}"><table class="${styles['md-table'] || 'md-table'}">${thead}${tbody}</table></div>`);
+            processedLines.push(
+              `<div class="${styles['table-container'] || 'table-container'}" data-md-table="1">` +
+              `${exportBar}` +
+              `<div class="${tableScrollClass}"><table class="${styles['md-table'] || 'md-table'}">${thead}${tbody}</table></div>` +
+              '</div>'
+            );
             continue;
           }
         }
@@ -441,14 +677,19 @@ const renderMarkdown = (content, styles = {}) => {
   
   preprocessed = blockquoteProcessedLines.join('\n');
 
+  const mdImageClass = styles['md-image-thumb'] || 'md-image-thumb';
+  const mdImageLinkClass = styles['md-image-link'] || 'md-image-link';
+  preprocessed = preprocessed.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt, rawUrl) => {
+    const url = unescapeHtml(rawUrl);
+    if (!isSafeImageUrl(url)) return alt || '';
+    const src = escapeHtml(url);
+    return `<a href="${src}" class="${mdImageLinkClass}" data-image-preview="1" target="_blank" rel="noopener noreferrer"><img class="${mdImageClass}" src="${src}" alt="${escapeHtml(alt || '')}" /></a>`;
+  });
 
   // Links: [text](url)
   preprocessed = preprocessed.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
 
-  // Inline code: `code`
-  preprocessed = preprocessed.replace(/`([^`]+)`/g, `<code class="${styles['inline-code'] || 'inline-code'}">$1</code>`);
-
-  // Bold and italic
+  // Bold and italic (math and inline code already extracted)
   preprocessed = preprocessed
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')
@@ -458,18 +699,95 @@ const renderMarkdown = (content, styles = {}) => {
     // Strikethrough: ~~text~~
     .replace(/~~([^~]+)~~/g, '<del>$1</del>');
 
-  // Paragraphs: wrap plain lines separated by blank lines
+  const isDisplayMathPlaceholder = (token) => {
+    const match = String(token || '').trim().match(/^§§MATH(\d+)§§$/);
+    if (!match) return false;
+    const block = mathBlocks[parseInt(match[1], 10)];
+    return !!(block && block.display);
+  };
+
+  const isBlockChunk = (chunk) => {
+    const trimmed = chunk.trim();
+    if (/^§§CBLOCK\d+§§$/.test(trimmed) || isDisplayMathPlaceholder(trimmed)) return true;
+    return /^\s*<\/(?:h\d|ul|ol|hr|blockquote)>/i.test(chunk)
+      || /^(?:<h\d|<ul|<ol|<div|<pre|<blockquote|<hr)/i.test(trimmed);
+  };
+
+  const wrapInlineParagraph = (text) => {
+    const lines = String(text || '').split(/\n/).map((l) => l.trim()).filter(Boolean);
+    return lines.length ? `<p>${lines.join('<br />')}</p>` : '';
+  };
+
+  const splitDisplayPlaceholders = (line) => {
+    const parts = [];
+    const re = /§§MATH(\d+)§§/g;
+    let lastIndex = 0;
+    let foundDisplay = false;
+    let match;
+    while ((match = re.exec(line))) {
+      const block = mathBlocks[parseInt(match[1], 10)];
+      if (!(block && block.display)) continue;
+      foundDisplay = true;
+      if (match.index > lastIndex) {
+        parts.push({ type: 'text', value: line.slice(lastIndex, match.index) });
+      }
+      parts.push({ type: 'display', value: match[0] });
+      lastIndex = match.index + match[0].length;
+    }
+    if (!foundDisplay) return null;
+    if (lastIndex < line.length) {
+      parts.push({ type: 'text', value: line.slice(lastIndex) });
+    }
+    return parts;
+  };
+
+  // Paragraphs: wrap plain lines, but keep display math and fenced code out of <p>
   preprocessed = preprocessed
     .split(/\n{2,}/)
     .map((chunk) => {
-      if (/^\s*<\/(?:h\d|ul|ol|hr|blockquote)>/i.test(chunk) || /^(?:<h\d|<ul|<ol|<div|<pre|<blockquote|<hr)/i.test(chunk.trim())) {
-        return chunk;
+      if (isBlockChunk(chunk) && !chunk.includes('\n')) return chunk;
+      if (chunk.trim().startsWith('<') && isBlockChunk(chunk.split('\n')[0])) return chunk;
+
+      const out = [];
+      let buffer = [];
+      const flush = () => {
+        const wrapped = wrapInlineParagraph(buffer.join('\n'));
+        if (wrapped) out.push(wrapped);
+        buffer = [];
+      };
+
+      for (const line of chunk.split('\n')) {
+        if (isBlockChunk(line)) {
+          flush();
+          out.push(line.trim());
+          continue;
+        }
+        const split = splitDisplayPlaceholders(line);
+        if (split) {
+          for (const part of split) {
+            if (part.type === 'display') {
+              flush();
+              out.push(part.value);
+            } else {
+              buffer.push(part.value);
+            }
+          }
+          continue;
+        }
+        buffer.push(line);
       }
-      if (chunk.trim().startsWith('<')) return chunk; // already a block
-      const lines = chunk.split(/\n/).map((l) => l.trim()).filter(Boolean);
-      return lines.length ? `<p>${lines.join('<br />')}</p>` : '';
+      flush();
+      return out.join('\n');
     })
     .join('\n');
+
+  preprocessed = restoreMath(preprocessed, mathBlocks, styles);
+
+  preprocessed = preprocessed.replace(/§§ICODE(\d+)§§/g, (_, idxStr) => {
+    const code = inlineCodes[parseInt(idxStr, 10)];
+    if (code == null) return '';
+    return `<code class="${styles['inline-code'] || 'inline-code'}">${code}</code>`;
+  });
 
   // Re-insert code blocks as styled containers
   const withCode = preprocessed.replace(/§§CBLOCK(\d+)§§/g, (_, idxStr) => {
@@ -526,34 +844,171 @@ const htmlToPlainText = (html) => {
     .replace(/[\s\u00A0\u200B\u200C\u200D\uFEFF]/g, '');
 };
 
+const ImageLightbox = ({ src, alt, onClose, closeLabel }) => {
+  useEffect(() => {
+    if (!src) return undefined;
+    const onKey = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [src, onClose]);
+
+  if (!src || !isSafeImageUrl(src)) return null;
+
+  return (
+    <div
+      className={styles['image-lightbox']}
+      role="dialog"
+      aria-modal="true"
+      aria-label={alt || closeLabel}
+      onClick={onClose}
+    >
+      <button
+        type="button"
+        className={styles['image-lightbox-close']}
+        onClick={onClose}
+        title={closeLabel}
+        aria-label={closeLabel}
+      >
+        ×
+      </button>
+      <img
+        src={src}
+        alt={alt || ''}
+        onClick={(event) => event.stopPropagation()}
+      />
+    </div>
+  );
+};
+
+const ImageThumbs = ({ images, onOpen, openLabel }) => {
+  if (!images || images.length === 0) return null;
+  return (
+    <div className={styles['image-thumbs']}>
+      {images.map((image, index) => (
+        <button
+          type="button"
+          key={`${image.url}-${index}`}
+          className={styles['image-thumb-btn']}
+          onClick={() => onOpen(image)}
+          title={openLabel}
+          aria-label={openLabel}
+        >
+          <img src={image.url} alt={image.alt || ''} className={styles['image-thumb']} />
+        </button>
+      ))}
+    </div>
+  );
+};
+
+const MarkdownBody = ({ html, mathJaxUrl, debounceMs = 0, closeImageLabel = 'Close' }) => {
+  const ref = useRef(null);
+  const [preview, setPreview] = useState(null);
+
+  const handleClick = (event) => {
+    const target = event.target instanceof Element ? event.target : event.target.parentElement;
+    const previewLink = target && target.closest('[data-image-preview]');
+    if (previewLink) {
+      event.preventDefault();
+      event.stopPropagation();
+      const img = previewLink.querySelector('img');
+      const src = previewLink.getAttribute('href') || img?.getAttribute('src');
+      if (src && isSafeImageUrl(src)) {
+        setPreview({ src, alt: img?.getAttribute('alt') || '' });
+      }
+      return;
+    }
+    const btn = target && target.closest('[data-export="excel"]');
+    if (!btn) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const wrap = btn.closest('[data-md-table]');
+    const table = wrap && wrap.querySelector('table');
+    if (table) downloadTableAsExcel(table);
+  };
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !html) return undefined;
+
+    let cancelled = false;
+    const run = () => {
+      if (cancelled || !el) return;
+      el.innerHTML = html;
+      typesetElement(el, { url: mathJaxUrl });
+    };
+
+    if (debounceMs > 0) {
+      const timer = setTimeout(run, debounceMs);
+      return () => {
+        cancelled = true;
+        clearTimeout(timer);
+      };
+    }
+
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [html, mathJaxUrl, debounceMs]);
+
+  if (!html) return null;
+  return (
+    <>
+      <div
+        ref={ref}
+        className={styles['markdown-body']}
+        onClick={handleClick}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+      {preview ? (
+        <ImageLightbox
+          src={preview.src}
+          alt={preview.alt}
+          onClose={() => setPreview(null)}
+          closeLabel={closeImageLabel}
+        />
+      ) : null}
+    </>
+  );
+};
+
 const ChatMessage = memo(function ChatMessage({
   msg,
   styles,
   currentLocale,
   assistantName,
-  mergedTheme
+  mergedTheme,
+  mathJaxUrl
 }) {
+  const [preview, setPreview] = useState(null);
+  const images = useMemo(() => getMessageImages(msg.content), [msg.content]);
+  const textContent = useMemo(() => getMessageText(msg.content), [msg.content]);
+
   const displayContent = useMemo(() => {
     if (msg.role === 'assistant') {
       if (msg.tool_calls && msg.tool_calls.length > 0) return '';
-      if (msg.content) return cleanAssistantContent(msg.content);
-      return msg.content;
+      if (textContent) return cleanAssistantContent(textContent);
+      return textContent;
     }
-    if (msg.content) return cleanAssistantContent(msg.content);
-    return msg.content;
-  }, [msg.role, msg.content, msg.tool_calls]);
+    if (textContent) return cleanAssistantContent(textContent);
+    return textContent;
+  }, [msg.role, textContent, msg.tool_calls]);
 
   const html = useMemo(() => {
     if (!displayContent || !String(displayContent).trim()) return '';
-    return renderMarkdown(displayContent, styles);
-  }, [displayContent, styles]);
+    return renderMarkdown(displayContent, styles, currentLocale);
+  }, [displayContent, styles, currentLocale]);
+
+  const hasVisual = images.length > 0 || (html && /<img\b/i.test(html));
 
   if (msg.role === 'tool') return null;
   if (msg.tool_calls && msg.tool_calls.length > 0) return null;
   if (msg.role === 'assistant') {
-    if (!displayContent || isDisplayContentEmpty(displayContent)) return null;
-    if (!htmlToPlainText(html)) return null;
-  } else if (!msg.content) {
+    if ((!displayContent || isDisplayContentEmpty(displayContent)) && !hasVisual) return null;
+    if (!htmlToPlainText(html) && !hasVisual) return null;
+  } else if (!messageHasContent(msg.content)) {
     return null;
   }
 
@@ -602,10 +1057,23 @@ const ChatMessage = memo(function ChatMessage({
                 msg.role === 'tool' ? currentLocale.tool : msg.role}
           </strong>:
           {html ? (
-            <div className={styles['markdown-body']} dangerouslySetInnerHTML={{ __html: html }} />
+            <MarkdownBody html={html} mathJaxUrl={mathJaxUrl} closeImageLabel={currentLocale.closeImage} />
           ) : null}
+          <ImageThumbs
+            images={images}
+            openLabel={currentLocale.openImage}
+            onOpen={(image) => setPreview(image)}
+          />
         </div>
       </div>
+      {preview ? (
+        <ImageLightbox
+          src={preview.url || preview.src}
+          alt={preview.alt}
+          onClose={() => setPreview(null)}
+          closeLabel={currentLocale.closeImage}
+        />
+      ) : null}
     </div>
   );
 });
@@ -675,9 +1143,14 @@ const ChatWidget = ({
                   // Called when a tool execution fails (e.g. 401); use for redirect/login UI
                   onToolError = null,
                   // URI substrings for heuristic static resources (e.g. ['instruction'] for mcp://mik-api/instruction)
-                  staticResourcePatterns = null
+                  staticResourcePatterns = null,
+                  // Optional MathJax script URL (self-host / CSP). Defaults to jsDelivr MathJax 3.
+                  mathJaxUrl
                     }) => {
   const [inputValue, setInputValue] = useState('');
+  const [attachedImages, setAttachedImages] = useState([]);
+  const [attachError, setAttachError] = useState('');
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recognitionError, setRecognitionError] = useState(null);
@@ -691,6 +1164,8 @@ const ChatWidget = ({
   const messagesEndRef = useRef(null);
   const messagesContainerRef = useRef(null);
   const inputRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const dragDepthRef = useRef(0);
   const isExpandedRef = useRef(false);
   const latestSendMessageRef = useRef(null);
   const lastMicActionAtRef = useRef(0);
@@ -781,8 +1256,13 @@ const ChatWidget = ({
 
   const streamingHtml = useMemo(() => {
     if (!streamingMessage?.content?.trim()) return '';
-    return renderMarkdown(streamingMessage.content, styles);
-  }, [streamingMessage?.content]);
+    return renderMarkdown(streamingMessage.content, styles, currentLocale);
+  }, [streamingMessage?.content, currentLocale]);
+
+  const greetingHtml = useMemo(
+    () => (greeting ? renderMarkdown(greeting, styles, currentLocale) : ''),
+    [greeting, currentLocale]
+  );
 
 
   useEffect(() => {
@@ -851,19 +1331,78 @@ const ChatWidget = ({
     }
   };
 
+  const addImageFiles = async (fileList) => {
+    const files = Array.from(fileList || []).filter(Boolean);
+    if (!files.length) return;
+
+    const remaining = MAX_IMAGES_PER_MESSAGE - attachedImages.length;
+    if (remaining <= 0) {
+      setAttachError((currentLocale.tooManyImages || '').replace('{count}', String(MAX_IMAGES_PER_MESSAGE)));
+      return;
+    }
+
+    const accepted = [];
+    let errorKey = '';
+    for (const file of files) {
+      if (accepted.length >= remaining) {
+        errorKey = 'tooMany';
+        break;
+      }
+      const result = await processImageFile(file);
+      if (!result.ok) {
+        errorKey = result.error || 'load';
+        continue;
+      }
+      accepted.push(result);
+    }
+
+    if (accepted.length) {
+      setAttachedImages((prev) => {
+        const room = MAX_IMAGES_PER_MESSAGE - prev.length;
+        return room > 0 ? [...prev, ...accepted.slice(0, room)] : prev;
+      });
+    }
+
+    if (errorKey === 'type') {
+      setAttachError(currentLocale.unsupportedImageType);
+    } else if (errorKey === 'size') {
+      setAttachError((currentLocale.imageTooLarge || '').replace('{size}', formatMaxImageSize()));
+    } else if (errorKey === 'load') {
+      setAttachError(currentLocale.imageLoadError);
+    } else if (errorKey === 'tooMany') {
+      setAttachError((currentLocale.tooManyImages || '').replace('{count}', String(MAX_IMAGES_PER_MESSAGE)));
+    } else {
+      setAttachError('');
+    }
+  };
+
   const handleSend = () => {
     if (isLoading || isRecording) {
       return;
     }
-    if (inputValue.trim()) {
-      sendMessageStream(inputValue);
-      setInputValue('');
+    const hasText = !!inputValue.trim();
+    const hasImages = attachedImages.length > 0;
+    if (!hasText && !hasImages) {
+      return;
     }
+    sendMessageStream(hasImages ? { text: inputValue, images: attachedImages } : inputValue);
+    setInputValue('');
+    setAttachedImages([]);
+    setAttachError('');
   };
 
   const handleCancel = () => {
     const restored = stop();
-    setInputValue(typeof restored === 'string' ? restored : '');
+    if (typeof restored === 'string') {
+      setInputValue(restored);
+      setAttachedImages([]);
+    } else if (restored && typeof restored === 'object') {
+      setInputValue(restored.text || '');
+      setAttachedImages(Array.isArray(restored.images) ? restored.images : []);
+    } else {
+      setInputValue('');
+      setAttachedImages([]);
+    }
     setTimeout(() => {
       if (inputRef.current) {
         inputRef.current.focus();
@@ -881,6 +1420,72 @@ const ChatWidget = ({
       handleSend();
     }
   };
+
+  const handlePaste = (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const files = [];
+    for (const item of items) {
+      if (item.kind === 'file' && item.type && item.type.startsWith('image/')) {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length) {
+      e.preventDefault();
+      addImageFiles(files);
+    }
+  };
+
+  const handleDragEnter = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current += 1;
+    if (e.dataTransfer?.types && Array.from(e.dataTransfer.types).includes('Files')) {
+      setIsDraggingFiles(true);
+    }
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) {
+      setIsDraggingFiles(false);
+    }
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+    if (isLoading || isRecording) return;
+    addImageFiles(e.dataTransfer?.files);
+  };
+
+  const handleAttachClick = () => {
+    if (isLoading || isRecording) return;
+    fileInputRef.current?.click();
+  };
+
+  const handleFileInputChange = (e) => {
+    addImageFiles(e.target.files);
+    e.target.value = '';
+  };
+
+  const removeAttachedImage = (id) => {
+    setAttachedImages((prev) => prev.filter((img) => img.id !== id));
+    setAttachError('');
+  };
+
+  const canSend = (!!inputValue.trim() || attachedImages.length > 0) && !isRecording;
 
   const toggleExpand = () => {
     setIsExpanded(!isExpanded);
@@ -1048,7 +1653,7 @@ const ChatWidget = ({
       // Find last assistant message index and set it
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i].role === 'assistant' && messages[i].content) {
-          const cleaned = cleanAssistantContent(messages[i].content);
+          const cleaned = cleanAssistantContent(getMessageText(messages[i].content));
           if (cleaned && !isDisplayContentEmpty(cleaned)) {
             lastProcessedMessageIndexRef.current = i;
             break;
@@ -1071,7 +1676,7 @@ const ChatWidget = ({
     let lastAssistantMessageIndex = -1;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === 'assistant' && messages[i].content) {
-        const cleaned = cleanAssistantContent(messages[i].content);
+        const cleaned = cleanAssistantContent(getMessageText(messages[i].content));
         if (cleaned && !isDisplayContentEmpty(cleaned)) {
           lastAssistantMessageIndex = i;
           break;
@@ -1083,7 +1688,7 @@ const ChatWidget = ({
     if (lastAssistantMessageIndex > lastProcessedMessageIndexRef.current && lastAssistantMessageIndex >= 0) {
       lastProcessedMessageIndexRef.current = lastAssistantMessageIndex;
       const message = messages[lastAssistantMessageIndex];
-      const cleanedContent = cleanAssistantContent(message.content);
+      const cleanedContent = cleanAssistantContent(getMessageText(message.content));
       showNotificationPopup(cleanedContent);
     }
   }, [messages, isExpanded, isLoadingHistory]);
@@ -1182,6 +1787,8 @@ const ChatWidget = ({
       chatTitle,
       inputValue,
       setInputValue,
+      attachedImages,
+      setAttachedImages,
       messages,
       isLoading,
       error,
@@ -1218,7 +1825,7 @@ const ChatWidget = ({
   }
 
   // Ensure CSS Modules processes all classes used in markdown
-  const _ = styles['inline-code'] || styles['code-block'] || styles['code-block-header'] || styles['code-block-body'] || styles['md-table'] || styles['checkbox-item'] || styles['checkbox-input'] || styles['checkbox-text'];
+  const _ = styles['inline-code'] || styles['code-block'] || styles['code-block-header'] || styles['code-block-body'] || styles['md-table'] || styles['table-container'] || styles['table-scroll'] || styles['table-export-bar'] || styles['table-export-btn'] || styles['checkbox-item'] || styles['checkbox-input'] || styles['checkbox-text'] || styles['math-inline'] || styles['math-display'] || styles['image-thumb'] || styles['image-thumbs'] || styles['image-thumb-btn'] || styles['md-image-thumb'] || styles['md-image-link'] || styles['image-lightbox'] || styles['image-lightbox-close'] || styles['attach-previews'] || styles['attach-preview'] || styles['attach-remove'] || styles['attach-button'] || styles['attach-input'] || styles['attach-error'] || styles['chat-composer-row'] || styles['chat-input-area-drop'] || styles['composer-action'];
 
   return (
     <div className={styles['chat-widget-wrapper']}>
@@ -1266,14 +1873,16 @@ const ChatWidget = ({
             className={styles['notification-content']}
             onClick={handleNotificationClick}
           >
-            <div className={styles['markdown-body']} dangerouslySetInnerHTML={{
-              __html: renderMarkdown(
-                notificationMessage.length > 150 
-                  ? notificationMessage.substring(0, 150) + '...' 
+            <MarkdownBody
+              html={renderMarkdown(
+                notificationMessage.length > 150
+                  ? notificationMessage.substring(0, 150) + '...'
                   : notificationMessage,
-                styles
-              )
-            }} />
+                styles,
+                currentLocale
+              )}
+              mathJaxUrl={mathJaxUrl}
+            />
           </div>
         </div>
       )}
@@ -1399,9 +2008,7 @@ const ChatWidget = ({
                   }}
                 >
                   <strong>{currentLocale.greetingTitle}</strong>
-                  <div className={styles['markdown-body']} dangerouslySetInnerHTML={{
-                    __html: renderMarkdown(greeting, styles)
-                  }} />
+                  <MarkdownBody html={greetingHtml} mathJaxUrl={mathJaxUrl} closeImageLabel={currentLocale.closeImage} />
                 </div>
               )}
 
@@ -1413,6 +2020,7 @@ const ChatWidget = ({
                   currentLocale={currentLocale}
                   assistantName={assistantName}
                   mergedTheme={mergedTheme}
+                  mathJaxUrl={mathJaxUrl}
                 />
               ))}
               {streamingMessage && streamingMessage.content && streamingMessage.content.trim() && (
@@ -1441,9 +2049,7 @@ const ChatWidget = ({
                     )}
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <strong>{assistantName || 'AI'}:</strong>
-                      <div className={styles['markdown-body']} dangerouslySetInnerHTML={{
-                        __html: streamingHtml
-                      }} />
+                      <MarkdownBody html={streamingHtml} mathJaxUrl={mathJaxUrl} debounceMs={200} closeImageLabel={currentLocale.closeImage} />
                     </div>
                   </div>
                 </div>
@@ -1488,68 +2094,119 @@ const ChatWidget = ({
             </div>
 
             <div 
-              className={styles['chat-input-area']}
+              className={`${styles['chat-input-area']}${isDraggingFiles ? ` ${styles['chat-input-area-drop']}` : ''}`}
               style={{
                 background: mergedTheme.inputAreaBackground,
                 borderTop: `1px solid ${mergedTheme.inputAreaBorderTop}`
               }}
+              onDragEnter={handleDragEnter}
+              onDragLeave={handleDragLeave}
+              onDragOver={handleDragOver}
+              onDrop={handleDrop}
             >
-              <textarea
-                ref={inputRef}
-                value={inputValue}
-                onChange={(e) => setInputValue(e.target.value)}
-                onKeyDown={handleKeyPress}
-                placeholder={isRecording ? currentLocale.speaking : currentLocale.enterMessage}
-                disabled={isLoading || isRecording}
-                rows="2"
-                style={{
-                  background: mergedTheme.inputBackground,
-                  borderColor: mergedTheme.inputBorder
-                }}
-                onFocus={(e) => {
-                  e.target.style.borderColor = mergedTheme.inputFocusBorder;
-                }}
-                onBlur={(e) => {
-                  e.target.style.borderColor = mergedTheme.inputBorder;
-                }}
-              />
-              {isLoading ? (
-                <button
-                  type="button"
-                  className={styles['cancel-request']}
-                  onClick={handleCancel}
-                  title={currentLocale.cancelRequest}
-                  aria-label={currentLocale.cancelRequest}
-                  style={{
-                    background: mergedTheme.cancelButtonBackground,
-                    color: mergedTheme.sendButtonColor
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.background = mergedTheme.cancelButtonHoverBackground;
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.background = mergedTheme.cancelButtonBackground;
-                  }}
-                >
-                  ×
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={handleSend}
-                  disabled={!inputValue.trim() || isRecording}
-                  title={currentLocale.send}
-                  aria-label={currentLocale.send}
-                  style={{
-                    background: (!inputValue.trim() || isRecording)
-                      ? mergedTheme.sendButtonDisabledBackground
-                      : mergedTheme.sendButtonBackground,
-                    color: mergedTheme.sendButtonColor
-                  }}
-                >
-                  ➤
-                </button>
+              {attachedImages.length > 0 && (
+                <div className={styles['attach-previews']}>
+                  {attachedImages.map((image) => (
+                    <div key={image.id} className={styles['attach-preview']}>
+                      <img src={image.dataUrl} alt={image.name || ''} />
+                      <button
+                        type="button"
+                        className={styles['attach-remove']}
+                        onClick={() => removeAttachedImage(image.id)}
+                        title={currentLocale.removeImage}
+                        aria-label={currentLocale.removeImage}
+                        disabled={isLoading || isRecording}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
               )}
+              <div className={styles['chat-composer-row']}>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  className={styles['attach-input']}
+                  accept={ACCEPTED_IMAGE_TYPES.join(',')}
+                  multiple
+                  onChange={handleFileInputChange}
+                  tabIndex={-1}
+                />
+                <button
+                  type="button"
+                  className={`${styles['composer-action']} ${styles['attach-button']}`}
+                  onClick={handleAttachClick}
+                  disabled={isLoading || isRecording}
+                  title={currentLocale.attachImage}
+                  aria-label={currentLocale.attachImage}
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                  </svg>
+                </button>
+                <textarea
+                  ref={inputRef}
+                  value={inputValue}
+                  onChange={(e) => setInputValue(e.target.value)}
+                  onKeyDown={handleKeyPress}
+                  onPaste={handlePaste}
+                  placeholder={isRecording ? currentLocale.speaking : currentLocale.enterMessage}
+                  disabled={isLoading || isRecording}
+                  rows="2"
+                  style={{
+                    background: mergedTheme.inputBackground,
+                    borderColor: mergedTheme.inputBorder
+                  }}
+                  onFocus={(e) => {
+                    e.target.style.borderColor = mergedTheme.inputFocusBorder;
+                  }}
+                  onBlur={(e) => {
+                    e.target.style.borderColor = mergedTheme.inputBorder;
+                  }}
+                />
+                {isLoading ? (
+                  <button
+                    type="button"
+                    className={`${styles['composer-action']} ${styles['cancel-request']}`}
+                    onClick={handleCancel}
+                    title={currentLocale.cancelRequest}
+                    aria-label={currentLocale.cancelRequest}
+                    style={{
+                      background: mergedTheme.cancelButtonBackground,
+                      color: mergedTheme.sendButtonColor
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.background = mergedTheme.cancelButtonHoverBackground;
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = mergedTheme.cancelButtonBackground;
+                    }}
+                  >
+                    ×
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className={styles['composer-action']}
+                    onClick={handleSend}
+                    disabled={!canSend}
+                    title={currentLocale.send}
+                    aria-label={currentLocale.send}
+                    style={{
+                      background: !canSend
+                        ? mergedTheme.sendButtonDisabledBackground
+                        : mergedTheme.sendButtonBackground,
+                      color: mergedTheme.sendButtonColor
+                    }}
+                  >
+                    ➤
+                  </button>
+                )}
+              </div>
+              {attachError ? (
+                <div className={styles['attach-error']} role="alert">{attachError}</div>
+              ) : null}
             </div>
 
             {/* Version info in bottom-right corner */}

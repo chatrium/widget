@@ -5,6 +5,8 @@
  * age-based cleanup and context size management.
  */
 
+import { messageHasContent, stripAllImages, stripOversizedImages } from './chatImages';
+
 const DB_NAME = 'chatHistoryDB';
 const STORE_NAME = 'conversations';
 const DB_VERSION = 1;
@@ -118,9 +120,9 @@ const messageIdentity = (msg) => JSON.stringify({
 
 const isPersistableMessage = (msg) => {
   if (!msg || msg.role === 'system') return false;
-  if (msg.role === 'assistant') return hasToolCalls(msg) || !!msg.content;
+  if (msg.role === 'assistant') return hasToolCalls(msg) || messageHasContent(msg.content);
   if (msg.role === 'tool') return !!(msg.content || msg.tool_call_id);
-  if (msg.role === 'user') return !!msg.content;
+  if (msg.role === 'user') return messageHasContent(msg.content);
   return false;
 };
 
@@ -173,35 +175,41 @@ export const saveMessages = async (storageKey, messages, maxContextSize) => {
       : paired.length;
     const capped = paired.slice(-cap);
 
-    const messagesToSave = capped.map(msg => ({
+    const toStoredItems = (msgs) => msgs.map(msg => ({
       message: msg,
       timestamp: previousTimestamps.get(messageIdentity(msg)) || Date.now()
     }));
+
+    const compacted = stripOversizedImages(capped);
+    let messagesToSave = toStoredItems(compacted);
 
     if (messagesToSave.length === 0) {
       return;
     }
 
-    const transaction = db.transaction([STORE_NAME], 'readwrite');
-    const store = transaction.objectStore(STORE_NAME);
-
-    const data = {
-      storageKey,
-      messages: messagesToSave,
-      lastUpdated: Date.now()
-    };
-
-    const request = store.put(data);
-
-    return new Promise((resolve, reject) => {
-      request.onsuccess = () => {
-        resolve();
-      };
-
-      request.onerror = () => {
-        reject(request.error);
-      };
+    const putRecord = (items) => new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.put({
+        storageKey,
+        messages: items,
+        lastUpdated: Date.now()
+      });
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+      transaction.onabort = () => reject(transaction.error || request.error);
     });
+
+    try {
+      await putRecord(messagesToSave);
+    } catch (_) {
+      messagesToSave = toStoredItems(stripAllImages(capped));
+      try {
+        await putRecord(messagesToSave);
+      } catch (_) {
+        // Don't throw - fail gracefully if quota is exhausted
+      }
+    }
   } catch (error) {
     // Don't throw - fail gracefully
   }

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.11] - 2026-09-21
+
+### Added
+- LaTeX in chat markdown via MathJax 3 (`$…$`, `$$…$$`, `\(...\)`, `\[…\]`)
+  - Formulas render in normal text, tables, quotes, lists, and headings
+  - Fenced/inline code and currency like `$12.50` are left as text
+  - Optional `mathJaxUrl` for a self-hosted script or CSP
+- Image attachments in chat
+  - Paperclip control, drag-and-drop, and paste onto the input
+  - Mini thumbnails before send (remove) and in sent/received bubbles (click to enlarge)
+  - User images go to the LLM as OpenAI vision `image_url` data URLs; text-only messages stay strings
+- Excel export on markdown tables
+  - Compact download control in each table header
+  - SpreadsheetML `.xls` (no SheetJS); cell text, including MathJax, is exported as plain text
+
 ## [3.0.10] - 2026-09-21
 
 ### Fixed

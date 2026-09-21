@@ -11,6 +11,7 @@ A modern, customizable chat widget with voice input support and MCP (Model Commu
 ## Features
 
 - **Voice Input**: Speech-to-text functionality for hands-free messaging
+- **Image attachments**: attach PNG/JPEG/GIF/WebP, mini previews, OpenAI-compatible vision messages
 - **MCP Integration**: Built-in support for Model Communication Protocol tools and resources
 - **MCP Resources**: Full support for contextual data (static) and real-time data (dynamic) resources
 - **Customizable UI**: Multiple positioning options and component visibility settings
@@ -966,6 +967,9 @@ Tool execution limits are configured per LLM config in the `llmConfigs` array (s
 - `assistantName`: Name displayed for AI assistant messages (default: 'AI')
 - `chatTitle`: Title shown in chat header (default: 'AI Assistant Chat')
 - `greeting`: Welcome message displayed when chat opens
+- `mathJaxUrl` (string, optional): MathJax 3 script URL for LaTeX in markdown. Defaults to jsDelivr `mathjax@3.2.2`. Use for self-hosting or CSP.
+
+Markdown in messages supports headings, lists, code, tables, checkboxes, and LaTeX (`$E=mc^2$`, `$$\int x\,dx$$`, `\(...\)`, `\[…\]`). Formulas also work inside tables and blockquotes; code blocks are not typeset. Each markdown table has an Excel export control in its header.
 
 #### Tools Configuration
 - `toolsSchema`: Custom tools schema array (overrides MCP tools if provided)
@@ -1072,7 +1076,7 @@ The widget uses **CSS Modules** for scoped styling, ensuring no conflicts with y
 - Smooth animations and transitions
 - Responsive shadows
 - Mobile-friendly design
-- Markdown rendering support (headings, lists, code blocks, tables, checkboxes)
+- Markdown rendering support (headings, lists, code blocks, tables with Excel export, checkboxes, images, LaTeX via MathJax)
 
 ### Theme Customization
 

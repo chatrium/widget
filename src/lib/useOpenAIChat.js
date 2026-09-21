@@ -1,6 +1,13 @@
 import { useCallback, useRef, useState, useMemo, useEffect } from 'react';
 import openaiLocales from './locales/openai';
 import { generateStorageKey, loadMessages, saveMessages, clearHistory } from './chatHistoryStorage';
+import {
+  buildUserMessageContent,
+  countContentTokens,
+  getMessageText,
+  getMessageImages,
+  normalizeUserPayload
+} from './chatImages';
 
 // Generate unique IDs for tool calls
 const generateToolCallId = () => `toolcall_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
@@ -62,8 +69,8 @@ const countMessageTokens = (message) => {
     if (message.role) {
       tokens += enc.encode(message.role).length;
     }
-    if (message.content && typeof message.content === 'string') {
-      tokens += enc.encode(message.content).length;
+    if (message.content) {
+      tokens += countContentTokens(message.content, (text) => enc.encode(text).length);
     }
     if (message.tool_calls && Array.isArray(message.tool_calls)) {
       for (const tc of message.tool_calls) {
@@ -88,8 +95,8 @@ const countMessageTokens = (message) => {
     if (message.role) {
       tokens += approximateTokenCount(message.role);
     }
-    if (message.content && typeof message.content === 'string') {
-      tokens += approximateTokenCount(message.content);
+    if (message.content) {
+      tokens += countContentTokens(message.content, approximateTokenCount);
     }
     if (message.tool_calls && Array.isArray(message.tool_calls)) {
       for (const tc of message.tool_calls) {
@@ -251,6 +258,7 @@ function parseAssistantResponse(assistantMsg, availableTools = new Set()) {
   let thinkText = null;
   let toolCallsJson = null;
   let displayContent = "";
+  const imageParts = getMessageImages(assistantMsg?.content);
 
   // New format: tool_calls is present directly
   if (assistantMsg.tool_calls && assistantMsg.tool_calls.length > 0) {
@@ -263,8 +271,9 @@ function parseAssistantResponse(assistantMsg, availableTools = new Set()) {
     toolCallsJson = toolCalls;
 
     // Process content: remove <think>...</think>
-    if (typeof assistantMsg.content === 'string') {
-      displayContent = assistantMsg.content;
+    const contentText = getMessageText(assistantMsg.content);
+    if (contentText) {
+      displayContent = contentText;
       const thinkMatch = displayContent.match(/<think>([\s\S]*?)<\/think>/i);
       if (thinkMatch) {
         thinkText = thinkMatch[1].trim();
@@ -272,9 +281,10 @@ function parseAssistantResponse(assistantMsg, availableTools = new Set()) {
       }
     }
   } else {
-    // Old format: parse from content
-    if (typeof assistantMsg.content === 'string') {
-      displayContent = assistantMsg.content;
+    // Old format: parse from content (string or vision parts)
+    const contentText = getMessageText(assistantMsg.content);
+    if (contentText) {
+      displayContent = contentText;
 
       const thinkMatch = displayContent.match(/<think>([\s\S]*?)<\/think>/i);
       if (thinkMatch) {
@@ -512,9 +522,8 @@ function parseAssistantResponse(assistantMsg, availableTools = new Set()) {
           }
         }
       }
-    } else if (assistantMsg.content) {
-      // Convert to string if value exists
-      displayContent = String(assistantMsg.content);
+    } else if (assistantMsg.content && typeof assistantMsg.content === 'string') {
+      displayContent = assistantMsg.content;
     }
   }
 
@@ -526,9 +535,17 @@ function parseAssistantResponse(assistantMsg, availableTools = new Set()) {
   return {
     think: thinkText,
     toolCallsJson: toolCallsJson,
-    displayContent: displayContent
+    displayContent: displayContent,
+    imageParts
   };
 }
+
+const toUiAssistantContent = (displayContent, imageParts) => {
+  if (imageParts && imageParts.length > 0) {
+    return buildUserMessageContent(displayContent, imageParts);
+  }
+  return displayContent;
+};
 
 export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale = 'en', mcpResources = [], readResourceFn = null, persistChatHistory = true, historyDepthHours = 24, debug = false, options = {}) => {
   const { onToolError, staticResourcePatterns } = options;
@@ -1397,11 +1414,15 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
   }, [validationOptions, locale, callOpenAI]);
 
   const sendWithMode = useCallback(async (userMessage, { streaming } = { streaming: false }) => {
-    if (!userMessage.trim() || isLoading || isProcessingRef.current) {
+    const { text: userText, images: userImages } = normalizeUserPayload(userMessage);
+    const hasText = !!(userText && userText.trim());
+    const hasImages = Array.isArray(userImages) && userImages.length > 0;
+    if ((!hasText && !hasImages) || isLoading || isProcessingRef.current) {
       return;
     }
 
-    const originalUserMessage = userMessage;
+    const originalUserMessage = hasImages ? { text: userText, images: userImages } : userText;
+    const userContent = buildUserMessageContent(userText, userImages);
     isProcessingRef.current = true;
     requestGenRef.current += 1;
     const myGen = requestGenRef.current;
@@ -1446,7 +1467,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
       }
       turnStartIndexRef.current = conversationHistoryRef.current.length;
       inFlightUserMessageRef.current = originalUserMessage;
-      conversationHistoryRef.current.push({ role: 'user', content: originalUserMessage });
+      conversationHistoryRef.current.push({ role: 'user', content: userContent });
 
       const { allMessages: initialMessages } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
       setMessages(initialMessages.filter(msg => msg.role !== 'system'));
@@ -1542,8 +1563,8 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
           throwIfCancelled();
           conversationHistoryRef.current.push(...toolResponses);
 
-          if ((parsed.displayContent || '').trim()) {
-            setMessages(prev => [...prev, { role: 'assistant', content: parsed.displayContent }]);
+          if ((parsed.displayContent || '').trim() || parsed.imageParts?.length) {
+            setMessages(prev => [...prev, { role: 'assistant', content: toUiAssistantContent(parsed.displayContent, parsed.imageParts) }]);
             await validateAssistantContent(parsed.displayContent, { signal });
             throwIfCancelled();
           } else {
@@ -1555,13 +1576,13 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
           continue;
         }
 
-        if ((parsed.displayContent || '').trim()) {
-          setMessages(prev => [...prev, { role: 'assistant', content: parsed.displayContent }]);
+        if ((parsed.displayContent || '').trim() || parsed.imageParts?.length) {
+          setMessages(prev => [...prev, { role: 'assistant', content: toUiAssistantContent(parsed.displayContent, parsed.imageParts) }]);
           await validateAssistantContent(parsed.displayContent, { signal });
           throwIfCancelled();
         }
 
-        const contentStr = typeof assistantMsg.content === 'string' ? assistantMsg.content : '';
+        const contentStr = getMessageText(assistantMsg.content);
         const hasControlTags = /<\|constrain\|>|<\|message\|>|<\|channel\|>/i.test(contentStr);
         if (hasControlTags && !usedControlTagRetryRef.current) {
           usedControlTagRetryRef.current = true;
@@ -1569,7 +1590,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
           continue;
         }
 
-        if (!(parsed.displayContent || '').trim() && !usedFollowUpRef.current) {
+        if (!(parsed.displayContent || '').trim() && !parsed.imageParts?.length && !usedFollowUpRef.current) {
           usedFollowUpRef.current = true;
           conversationHistoryRef.current.push({ role: 'system', content: followupInstruction });
           continue;

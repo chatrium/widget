@@ -23,5 +23,14 @@ export default {
   network: "Ошибка сети. Проверьте подключение к интернету.",
   unknown: "Произошла неизвестная ошибка.",
   voiceNotSupported: "Голосовой ввод не поддерживается в вашем браузере.",
-  messageExcludedFromContext: "Сообщение устарело и не передаётся AI помощнику"
+  messageExcludedFromContext: "Сообщение устарело и не передаётся AI помощнику",
+  downloadExcel: "Скачать Excel",
+  attachImage: "Прикрепить изображение",
+  removeImage: "Удалить изображение",
+  imageTooLarge: "Изображение слишком большое (макс. {size})",
+  unsupportedImageType: "Неподдерживаемый тип файла. Используйте PNG, JPEG, GIF или WebP.",
+  tooManyImages: "Можно прикрепить не больше {count} изображений",
+  openImage: "Открыть изображение",
+  closeImage: "Закрыть изображение",
+  imageLoadError: "Не удалось загрузить изображение"
 };

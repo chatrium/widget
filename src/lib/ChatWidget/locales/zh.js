@@ -23,5 +23,14 @@ export default {
   network: "网络错误。请检查网络连接。",
   unknown: "发生未知错误。",
   voiceNotSupported: "您的浏览器不支持语音输入。",
-  messageExcludedFromContext: "消息已过时，不会发送给AI助手"
+  messageExcludedFromContext: "消息已过时，不会发送给AI助手",
+  downloadExcel: "下载 Excel",
+  attachImage: "附加图片",
+  removeImage: "移除图片",
+  imageTooLarge: "图片过大（最大 {size}）",
+  unsupportedImageType: "不支持的文件类型。请使用 PNG、JPEG、GIF 或 WebP。",
+  tooManyImages: "最多可附加 {count} 张图片",
+  openImage: "打开图片",
+  closeImage: "关闭图片",
+  imageLoadError: "无法加载图片"
 };
