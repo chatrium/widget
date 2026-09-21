@@ -87,19 +87,14 @@ module.exports = [
     ],
     external: isExternal
   },
-  // ES module build (paths with .js for webpack 5 fullySpecified resolution)
+  // ES module build
   {
     input: 'src/index.js',
     output: {
       file: 'dist/index.esm.js',
       format: 'es',
       exports: 'named',
-      sourcemap: true,
-      paths: (id) => {
-        if (id === 'react/jsx-runtime') return 'react/jsx-runtime.js';
-        if (id === 'react/jsx-dev-runtime') return 'react/jsx-dev-runtime.js';
-        return id;
-      }
+      sourcemap: true
     },
     plugins: [
       postcssInject,
