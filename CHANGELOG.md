@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.9] - 2026-09-21
+
+### Fixed
+- Widget styles apply again on `import { ChatWidget }` without a separate CSS import
+  - 3.0.8 extracted CSS to `@chatrium/widget/styles` and stopped injecting it into the JS bundle
+  - Existing apps that did not add that import rendered unstyled controls
+  - Styles are injected into CJS/ESM/UMD again; `import "@chatrium/widget/styles"` remains optional
+
 ## [3.0.8] - 2026-09-19
 
 ### Added

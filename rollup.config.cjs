@@ -1,3 +1,4 @@
+const path = require('path');
 const resolve = require('@rollup/plugin-node-resolve');
 const commonjs = require('@rollup/plugin-commonjs');
 const babel = require('@rollup/plugin-babel');
@@ -36,12 +37,21 @@ const sharedPlugins = [
   })
 ];
 
-const postcssPlugin = (extract) => postcss({
-  extract,
+const cssModules = {
+  generateScopedName: '[hash:base64:8]'
+};
+
+const postcssInject = postcss({
+  extract: false,
+  inject: true,
   minimize: true,
-  modules: {
-    generateScopedName: '[hash:base64:8]'
-  }
+  modules: cssModules
+});
+
+const postcssExtract = postcss({
+  extract: path.resolve(__dirname, 'dist/chat-widget.css'),
+  minimize: true,
+  modules: cssModules
 });
 
 const isExternal = (id) => (
@@ -71,7 +81,7 @@ module.exports = [
       sourcemap: true
     },
     plugins: [
-      postcssPlugin('chat-widget.css'),
+      postcssInject,
       ...sharedPlugins,
       createBabelPlugin('automatic')
     ],
@@ -92,7 +102,7 @@ module.exports = [
       }
     },
     plugins: [
-      postcssPlugin('chat-widget.css'),
+      postcssInject,
       ...sharedPlugins,
       createBabelPlugin('automatic'),
       terser()
@@ -114,11 +124,20 @@ module.exports = [
       sourcemap: true
     },
     plugins: [
-      postcssPlugin('chat-widget.css'),
+      postcssInject,
       ...sharedPlugins,
       createBabelPlugin('classic'),
       terser()
     ],
     external: isExternalUmd
+  },
+  // Standalone CSS for optional `import '@chatrium/widget/styles'`
+  {
+    input: 'src/styles-entry.js',
+    output: {
+      file: path.join(__dirname, '.css-build-dummy.js'),
+      format: 'es'
+    },
+    plugins: [postcssExtract]
   }
 ];

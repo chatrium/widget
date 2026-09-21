@@ -63,10 +63,11 @@ This makes it an exceptionally powerful yet straightforward solution for automat
 npm install @chatrium/widget
 ```
 
+Widget styles are applied automatically on import. Optional: `import "@chatrium/widget/styles"` if you want the CSS as a separate file.
+
 ```javascript
 // src/App.js
 import { ChatWidget, useMCPServer } from "@chatrium/widget";
-import "@chatrium/widget/styles";
 import { TOOLS } from "./mcp_tools";
 
 function App() {
@@ -103,7 +104,6 @@ npm install @chatrium/widget
 // src/App.tsx
 import React from 'react';
 import { ChatWidget, useMCPServer } from "@chatrium/widget";
-import "@chatrium/widget/styles";
 import { TOOLS } from "./mcp_tools";
 
 function App(): JSX.Element {
