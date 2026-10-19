@@ -214,6 +214,32 @@ const filterMessagesByContext = (messages, maxTokens) => {
   };
 };
 
+/**
+ * APIs that accept OpenAI chat format allow role "system" only as the first message.
+ * Keep the first system message at index 0. Rewrite any later system message to user.
+ * If there is no system message, leave the list unchanged.
+ */
+const normalizeRolesForApi = (messages) => {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return messages || [];
+  }
+  const firstSystemIndex = messages.findIndex((msg) => msg?.role === 'system');
+  if (firstSystemIndex === -1) {
+    return messages;
+  }
+  const rest = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (i === firstSystemIndex) continue;
+    const msg = messages[i];
+    if (msg?.role === 'system') {
+      rest.push({ ...msg, role: 'user' });
+    } else {
+      rest.push(msg);
+    }
+  }
+  return [messages[firstSystemIndex], ...rest];
+};
+
 const toApiToolCalls = (toolCallsJson) => toolCallsJson.map(tc => ({
   id: tc.id,
   type: 'function',
@@ -1484,6 +1510,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
         throwIfCancelled();
         loopCount++;
         const { filtered } = filterMessagesByContext(conversationHistoryRef.current, maxContextSize);
+        const apiMessages = normalizeRolesForApi(filtered);
         let assistantMsg;
 
         if (streaming) {
@@ -1491,7 +1518,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
           let accumulatedContent = '';
           let toolCalls = null;
 
-          await callOpenAIStream(filtered, { signal }, (delta) => {
+          await callOpenAIStream(apiMessages, { signal }, (delta) => {
             if (userCancelledRef.current || signal.aborted) {
               return;
             }
@@ -1543,7 +1570,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
             ...(toolCalls && { tool_calls: toolCalls })
           };
         } else {
-          const response = await callOpenAI(filtered, { signal });
+          const response = await callOpenAI(apiMessages, { signal });
           assistantMsg = response.choices[0].message;
         }
 
@@ -1551,7 +1578,7 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
 
         if (isEmptyKeyEmptyObjectContent(assistantMsg.content) && !usedEmptyJsonRetryRef.current) {
           usedEmptyJsonRetryRef.current = true;
-          conversationHistoryRef.current.push({ role: 'system', content: retryInstruction });
+          conversationHistoryRef.current.push({ role: 'user', content: retryInstruction });
           continue;
         }
 
@@ -1586,13 +1613,13 @@ export const useOpenAIChat = (mcpClient, llmConfigs, actualToolsSchema, locale =
         const hasControlTags = /<\|constrain\|>|<\|message\|>|<\|channel\|>/i.test(contentStr);
         if (hasControlTags && !usedControlTagRetryRef.current) {
           usedControlTagRetryRef.current = true;
-          conversationHistoryRef.current.push({ role: 'system', content: convertInstruction });
+          conversationHistoryRef.current.push({ role: 'user', content: convertInstruction });
           continue;
         }
 
         if (!(parsed.displayContent || '').trim() && !parsed.imageParts?.length && !usedFollowUpRef.current) {
           usedFollowUpRef.current = true;
-          conversationHistoryRef.current.push({ role: 'system', content: followupInstruction });
+          conversationHistoryRef.current.push({ role: 'user', content: followupInstruction });
           continue;
         }
 

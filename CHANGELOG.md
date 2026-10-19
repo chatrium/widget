@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.12] - 2026-10-19
+
+### Fixed
+- Chat completions no longer send a `system` message after `user` or `assistant`
+  - Retry, tool-format, and follow-up instructions are appended as `user` messages
+  - Any later `system` message is rewritten to `user` before the request, so only `messages[0]` stays `system`
+
 ## [3.0.11] - 2026-09-21
 
 ### Added
